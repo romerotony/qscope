@@ -132,9 +132,20 @@ impl Source {
   }
 
   pub async fn details(&mut self, id: &str) -> Result<String> {
-    match self {
-      Self::Live(backend) => backend.details(id).await,
-      Self::Demo(demo) => demo.details(id),
+    let (kind, raw) = match self {
+      Self::Live(backend) => (backend.kind, backend.details(id).await?),
+      Self::Demo(demo) => (demo.kind, demo.details(id)?),
+    };
+    match kind {
+      Scheduler::Flux => crate::details::flux(&raw),
+      _ => {
+        let formatted = crate::details::slurm(&raw)?;
+        Ok(if matches!(self, Self::Demo(_)) {
+          format!("DEMO — simulated data; no controller or files accessed.\n\n{formatted}")
+        } else {
+          formatted
+        })
+      }
     }
   }
 
@@ -361,7 +372,7 @@ mod tests {
         .details(&jobs[0].id)
         .await
         .unwrap()
-        .contains("JobId=")
+        .contains("Overview")
     );
   }
 
@@ -386,13 +397,15 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn flux_demo_details_are_json() {
+  async fn flux_demo_details_are_formatted() {
     let mut source = Source::demo(Scheduler::Flux);
     let jobs = source.jobs().await.unwrap();
     assert_eq!(jobs[2].state, "SCHED");
-    let details: serde_json::Value =
-      serde_json::from_str(&source.details(&jobs[0].id).await.unwrap()).unwrap();
-    assert_eq!(details["demo"], true);
+    let details = source.details(&jobs[0].id).await.unwrap();
+    assert!(details.starts_with("Overview\n"));
+    assert!(details.contains("Demo\n"));
+    assert!(details.contains("Simulated"));
+    assert!(!details.contains("{\""));
   }
 
   #[tokio::test]

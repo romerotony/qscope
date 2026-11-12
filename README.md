@@ -81,6 +81,8 @@ filter appears in the top border of the Jobs box. Shortcuts are listed in the po
 | Enter / Esc while filtering | Finish editing |
 | s | Cycle ascending ID/name/state sort |
 | Enter | Fetch selected job details and focus that pane |
+| Enter (stdout focused) | Toggle maximized stdout / 50-50 split layout |
+| Esc / q (stdout maximized) | Restore split layout, keeping stdout focused |
 | Page Up / Page Down | Scroll details |
 | Tab / Shift-Tab | Switch jobs / stdout; disabled while details is focused |
 | Ctrl-u / Ctrl-d (text pane focused) | Scroll back / forward by 10 lines |
@@ -117,7 +119,7 @@ A panel below the job list follows the selected job, comparing **requested** and
 time limit and assigned hosts.
 Jobs and Resources format elapsed time as `MM:SS`, `HH:MM:SS`, or `D-HH:MM:SS`;
 pending jobs show `—`. It refreshes at the configured scheduler interval;
-`r` also requests a refresh. `Enter` temporarily replaces it with raw job details;
+`r` also requests a refresh. `Enter` temporarily replaces it with formatted job details;
 `Esc` (after returning focus from stdout, if needed) restores the resources view.
 
 Slurm uses `ReqTRES` and `AllocTRES` from `scontrol show job`, retaining memory
@@ -136,6 +138,14 @@ guess how many tasks are running. Demo data includes MPI and threaded layouts.
 Details retains keyboard focus until `Esc`, `q`, or a click on Jobs/Stdout closes it. Pane-switching keys and
 job/filter actions are ignored there; scrolling, help, refresh, and quitting
 remain available.
+
+Details uses bold section headings and aligned label/value rows: Overview,
+Timing, Execution, Files, plus scheduling, exception, and resource information
+when available. Missing values show `—`, long values wrap, and unknown scheduler
+fields remain accessible in Additional information. Flux epoch timestamps are
+displayed in UTC; Slurm timestamps retain the scheduler's reported timezone.
+Demo mode uses the same formatting. There is no raw-output toggle. Resource and
+stdout lookup still use the original backend responses, not the formatted text.
 
 Mouse scrolling over Jobs changes the selection; over Stdout it scrolls and
 pauses following. Scrolling back over Jobs leaves Stdout and resumes following.

@@ -2,6 +2,7 @@
 //! and keyboard handling so a slow controller does not freeze the terminal.
 
 mod config;
+mod details;
 mod duration;
 mod output;
 mod resources;

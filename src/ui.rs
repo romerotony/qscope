@@ -49,6 +49,7 @@ pub struct App {
   pub output_follow: bool,
   output_pending: Option<String>,
   pub output_focus: bool,
+  pub output_maximized: bool,
   /// Tracks the first `g` of Vim's `gg` shortcut while stdout is focused.
   output_g_pending: bool,
   /// The captured cancellation target, not a row number that could change.
@@ -96,6 +97,7 @@ impl App {
       output_follow: true,
       output_pending: None,
       output_focus: false,
+      output_maximized: false,
       output_g_pending: false,
       confirm: None,
       help_open: false,
@@ -217,6 +219,7 @@ impl App {
   pub fn set_output_focus(&mut self, focused: bool) {
     if self.output_focus && !focused {
       self.follow_output();
+      self.output_maximized = false;
     }
     self.output_focus = focused;
   }
@@ -335,6 +338,19 @@ impl App {
     self.last_job_click = None;
     let second_g = self.output_g_pending;
     self.output_g_pending = false;
+    if self.output_focus {
+      match key.code {
+        KeyCode::Enter => {
+          self.output_maximized = !self.output_maximized;
+          return true;
+        }
+        KeyCode::Esc | KeyCode::Char('q') if self.output_maximized => {
+          self.output_maximized = false;
+          return true;
+        }
+        _ => {}
+      }
+    }
     // Keyboard pane navigation cannot dismiss Details; use Esc, q, or a mouse click.
     if self.details_focus
       && matches!(
@@ -518,8 +534,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
       .wrap(Wrap { trim: false }),
     status_columns[1],
   );
+  if app.output_maximized {
+    // Hidden panes must not retain clickable hit targets from the split layout.
+    app.panes = PaneAreas::default();
+    app.panes.output = areas[0];
+    draw_output(frame, app, areas[0]);
+    draw_overlays(frame, app);
+    return;
+  }
   let columns =
-    Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(areas[0]);
+    Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(areas[0]);
   let lower_panel = if app.details.is_some() {
     Constraint::Percentage(60)
   } else {
@@ -546,7 +570,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
   };
   app.panes.output = columns[1];
   // Keep the primary fields legible when stdout takes half the screen.
-  let compact = columns[0].width < 110;
+  let compact = columns[0].width < 90;
   // Day-prefixed clocks need more than the usual eight characters.
   let elapsed_width = app
     .visible
@@ -620,7 +644,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Length(12),
         Constraint::Percentage(25),
         Constraint::Length(12),
-        Constraint::Length(10),
+        Constraint::Length(12),
         Constraint::Length(elapsed_width.max(10)),
         Constraint::Length(5),
         Constraint::Length(6),
@@ -671,16 +695,36 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
   frame.render_stateful_widget(table, panels[0], &mut app.table);
   if let Some((id, text)) = &app.details {
     frame.render_widget(
-      Paragraph::new(text.as_str())
-        .wrap(Wrap { trim: false })
-        .scroll((app.detail_scroll, 0))
-        .block(panel(app.details_focus).title(format!(" Details: {id} "))),
+      Paragraph::new(Text::from(
+        text
+          .lines()
+          .map(|line| {
+            if !line.is_empty() && !line.starts_with(char::is_whitespace) {
+              Line::styled(
+                line,
+                Style::default()
+                  .fg(Color::White)
+                  .add_modifier(Modifier::BOLD),
+              )
+            } else {
+              Line::from(line)
+            }
+          })
+          .collect::<Vec<_>>(),
+      ))
+      .wrap(Wrap { trim: false })
+      .scroll((app.detail_scroll, 0))
+      .block(panel(app.details_focus).title(format!(" Details: {id} "))),
       panels[1],
     );
   } else {
     draw_resources(frame, app, panels[1]);
   }
   draw_output(frame, app, columns[1]);
+  draw_overlays(frame, app);
+}
+
+fn draw_overlays(frame: &mut Frame, app: &mut App) {
   if let Some(id) = &app.confirm {
     let area = centered(frame.area());
     // Erase underlying table cells before drawing the confirmation overlay.
@@ -700,6 +744,8 @@ const HELP: &str = "Navigation
   Mouse wheel       Scroll pane under pointer (1 line)
   Left click        Select job / focus pane; closes details when leaving it
   Double click      Open and focus job details
+  Enter in stdout   Maximize / restore stdout
+  Esc / q in maximized stdout Restore split layout
 
 Jobs
   /                 Edit fuzzy filter (ranked by relevance)
@@ -883,9 +929,21 @@ fn panel(focused: bool) -> Block<'static> {
 }
 
 fn draw_output(frame: &mut Frame, app: &mut App, area: Rect) {
+  let path = std::path::Path::new(&app.output_path);
+  let filename = path
+    .file_name()
+    .map(|name| {
+      let display = path
+        .parent()
+        .and_then(std::path::Path::file_name)
+        .map(|parent| std::path::Path::new(parent).join(name))
+        .unwrap_or_else(|| std::path::PathBuf::from(name));
+      format!(" · {}", display.display())
+    })
+    .unwrap_or_default();
   let title = match &app.output_id {
     Some(id) => format!(
-      " Stdout: {id} · {} ",
+      " Stdout: {id} · {}{filename} ",
       if app.output_follow {
         "following"
       } else {
@@ -897,23 +955,15 @@ fn draw_output(frame: &mut Frame, app: &mut App, area: Rect) {
   let block = panel(app.output_focus).title(title);
   let inner = block.inner(area);
   frame.render_widget(block, area);
-  let regions = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(inner);
-  app.panes.output_text = regions[1];
-  frame.render_widget(
-    Paragraph::new(app.output_path.as_str()).style(Style::default().fg(Color::DarkGray)),
-    regions[0],
-  );
+  app.panes.output_text = inner;
   if app.output_id.is_none() {
-    frame.render_widget(
-      Paragraph::new("Select a job to preview its stdout."),
-      regions[1],
-    );
+    frame.render_widget(Paragraph::new("Select a job to preview its stdout."), inner);
     return;
   }
   // Slice by lines rather than Paragraph's u16 scroll offset. Reads are bounded,
   // but a file containing many short lines can still exceed that offset range.
   let lines: Vec<_> = app.output_text.lines().collect();
-  let height = regions[1].height as usize;
+  let height = inner.height as usize;
   app.output_cursor = app.output_cursor.min(lines.len().saturating_sub(1));
   if app.output_follow {
     app.output_cursor = lines.len().saturating_sub(1);
@@ -928,7 +978,7 @@ fn draw_output(frame: &mut Frame, app: &mut App, area: Rect) {
   }
   let start = app.output_top;
   let end = (start + height).min(lines.len());
-  frame.render_widget(Paragraph::new(lines[start..end].join("\n")), regions[1]);
+  frame.render_widget(Paragraph::new(lines[start..end].join("\n")), inner);
 }
 
 // Cap the modal dimensions to the available space to support small terminals.
@@ -946,6 +996,81 @@ fn centered(area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
   use super::*;
+  #[test]
+  fn enter_maximizes_stdout_and_escape_restores_without_losing_pause() {
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    let mut app = App::new("Slurm");
+    app.replace_jobs(vec![job("1"), job("2")]);
+    app.output_id = Some("1".into());
+    app.set_output_focus(true);
+    app.replace_output("line\n".repeat(100));
+    app.move_output(-5);
+    app.replace_output("new lines\n".repeat(110));
+    let cursor = app.output_cursor;
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(app.navigate(enter));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    assert!(app.output_maximized);
+    assert_eq!(app.panes.output, Rect::new(0, 0, 120, 27));
+    assert_eq!(app.panes.jobs, Rect::default());
+    assert!(app.details.is_none());
+    assert_eq!(app.output_cursor, cursor);
+    assert!(!app.output_follow);
+    app.help_open = true;
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    assert!(app.panes.help.width > 0);
+    app.help_open = false;
+    assert!(app.navigate(escape));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    assert!(!app.output_maximized);
+    assert!(app.output_focus);
+    assert_eq!(app.panes.output.width, 60);
+    assert_eq!(app.selected().unwrap().id, "1");
+    assert!(!app.output_follow);
+    app.navigate(enter);
+    assert!(app.output_maximized);
+    assert!(app.navigate(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
+    assert!(!app.output_maximized);
+    assert!(app.output_focus);
+    app.navigate(enter);
+    assert!(app.output_maximized);
+    app.navigate(enter);
+    assert!(!app.output_maximized);
+    app.navigate(enter);
+    app.navigate(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+    assert!(!app.output_maximized);
+    assert!(!app.output_focus);
+    assert!(app.output_follow);
+  }
+  #[test]
+  fn stdout_starts_at_top_and_filename_is_next_to_follow_status() {
+    let backend = ratatui::backend::TestBackend::new(100, 10);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    let mut app = App::new("Slurm");
+    app.output_id = Some("123".into());
+    app.output_path = "/shared/logs/slurm-123.out".into();
+    app.replace_output("first line\nsecond line\n".into());
+    terminal
+      .draw(|frame| draw_output(frame, &mut app, frame.area()))
+      .unwrap();
+    let buffer = terminal.backend().buffer();
+    let title: String = (0..100).map(|x| buffer[(x, 0)].symbol()).collect();
+    let first: String = (1..99).map(|x| buffer[(x, 1)].symbol()).collect();
+    assert!(title.contains("following · logs/slurm-123.out"));
+    assert!(first.starts_with("first line"));
+    assert!(!title.contains("/shared/logs"));
+    assert_eq!(app.panes.output_text, Rect::new(1, 1, 98, 8));
+    app.output_start();
+    terminal
+      .draw(|frame| draw_output(frame, &mut app, frame.area()))
+      .unwrap();
+    let title: String = (0..100)
+      .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+      .collect();
+    assert!(title.contains("paused · logs/slurm-123.out"));
+  }
   #[test]
   fn q_closes_focused_details_but_remains_global_elsewhere() {
     let mut app = App::new("Slurm");
