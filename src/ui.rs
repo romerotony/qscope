@@ -37,6 +37,7 @@ pub struct App {
   /// Shared by Enter and double-click; the worker dispatches this when idle.
   pub details_request: Option<String>,
   last_job_click: Option<(String, Instant)>,
+  last_output_click: Option<(u16, u16, Instant)>,
   /// Selected job's resource snapshot, or a diagnostic from its last query.
   pub resources: Option<(String, Result<crate::resources::Resources, String>)>,
   /// Stdout follows selection. Pausing retains a stable snapshot and cursor;
@@ -88,6 +89,7 @@ impl App {
       details_focus: false,
       details_request: None,
       last_job_click: None,
+      last_output_click: None,
       resources: None,
       output_id: None,
       output_path: String::new(),
@@ -173,6 +175,7 @@ impl App {
   }
 
   pub fn reset_output(&mut self) {
+    self.last_output_click = None;
     self.output_text = "Loading stdout…".into();
     self.output_path.clear();
     self.output_cursor = 0;
@@ -220,8 +223,25 @@ impl App {
     if self.output_focus && !focused {
       self.follow_output();
       self.output_maximized = false;
+      self.last_output_click = None;
     }
     self.output_focus = focused;
+  }
+
+  fn click_output(&mut self, column: u16, row: u16) {
+    self.set_output_focus(true);
+    let now = Instant::now();
+    let double_click = self.last_output_click.is_some_and(|(x, y, at)| {
+      column.abs_diff(x) <= 1
+        && row.abs_diff(y) <= 1
+        && now.duration_since(at) <= Duration::from_millis(400)
+    });
+    if double_click {
+      self.output_maximized = !self.output_maximized;
+      self.last_output_click = None;
+    } else {
+      self.last_output_click = Some((column, row, now));
+    }
   }
 
   fn select_job_at(&mut self, column: u16, row: u16) {
@@ -270,10 +290,12 @@ impl App {
     let position = (event.column, event.row).into();
     if self.confirm.is_some() || self.searching {
       self.last_job_click = None;
+      self.last_output_click = None;
       return;
     }
     if self.help_open {
       self.last_job_click = None;
+      self.last_output_click = None;
       if self.panes.help.contains(position) {
         self.help_scroll = self.help_scroll.saturating_add_signed(delta as i16);
       }
@@ -287,6 +309,9 @@ impl App {
         self.details = None;
         self.output_g_pending = false;
         self.set_output_focus(self.panes.output.contains(position));
+        if self.output_focus {
+          self.click_output(event.column, event.row);
+        }
         self.select_job_at(event.column, event.row);
       } else if self.panes.details.contains(position) {
         self.detail_scroll = self.detail_scroll.saturating_add_signed(delta as i16);
@@ -296,16 +321,18 @@ impl App {
     self.output_g_pending = false;
     if !clicked {
       self.last_job_click = None;
+      self.last_output_click = None;
     }
     if clicked {
       if self.panes.output.contains(position) {
-        self.set_output_focus(true);
+        self.click_output(event.column, event.row);
         self.last_job_click = None;
       } else if self.panes.jobs.contains(position) || self.panes.resources.contains(position) {
         self.set_output_focus(false);
         self.select_job_at(event.column, event.row);
       } else {
         self.last_job_click = None;
+        self.last_output_click = None;
       }
       return;
     }
@@ -336,6 +363,7 @@ impl App {
   /// Returning false lets the event loop handle non-navigation shortcuts.
   pub fn navigate(&mut self, key: KeyEvent) -> bool {
     self.last_job_click = None;
+    self.last_output_click = None;
     let second_g = self.output_g_pending;
     self.output_g_pending = false;
     if self.output_focus {
@@ -351,7 +379,7 @@ impl App {
         _ => {}
       }
     }
-    // Keyboard pane navigation cannot dismiss Details; use Esc, q, or a mouse click.
+    // Keyboard pane navigation cannot dismiss Details; use Enter, Esc, q, or a click.
     if self.details_focus
       && matches!(
         key.code,
@@ -396,7 +424,7 @@ impl App {
         self.details_focus = panes[next] == 1;
         return true;
       }
-      KeyCode::Esc | KeyCode::Char('q') if self.details_focus => {
+      KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') if self.details_focus => {
         self.details_focus = false;
         self.details = None;
         self.details_request = None;
@@ -543,7 +571,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     return;
   }
   let columns =
-    Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(areas[0]);
+    Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(areas[0]);
   let lower_panel = if app.details.is_some() {
     Constraint::Percentage(60)
   } else {
@@ -570,7 +598,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
   };
   app.panes.output = columns[1];
   // Keep the primary fields legible when stdout takes half the screen.
-  let compact = columns[0].width < 90;
+  let compact = columns[0].width < 100;
   // Day-prefixed clocks need more than the usual eight characters.
   let elapsed_width = app
     .visible
@@ -743,7 +771,7 @@ const HELP: &str = "Navigation
   j/k or Down/Up    Select job / scroll focused pane
   Mouse wheel       Scroll pane under pointer (1 line)
   Left click        Select job / focus pane; closes details when leaving it
-  Double click      Open and focus job details
+  Double click      Open job details / maximize or restore stdout
   Enter in stdout   Maximize / restore stdout
   Esc / q in maximized stdout Restore split layout
 
@@ -752,7 +780,7 @@ Jobs
   Enter / Esc       Finish filter editing
   s                 Cycle ID / name / state sort
   Enter             Open and focus selected job details
-  Esc / q in details Close details and return to jobs
+  Enter / Esc / q in details Close details and return to jobs
   Esc               Return from stdout, or close details / clear filter
   c                 Cancel selected job (confirmation required)
   y / n / Esc       Confirm / dismiss cancellation
@@ -997,6 +1025,43 @@ fn centered(area: Rect) -> Rect {
 mod tests {
   use super::*;
   #[test]
+  fn double_click_stdout_toggles_maximize_without_changing_pause() {
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    let mut app = App::new("Slurm");
+    app.output_id = Some("1".into());
+    app.replace_output("one\ntwo\nthree\n".into());
+    app.move_output(-1);
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let click = wheel(MouseEventKind::Down(MouseButton::Left), app.panes.output);
+    app.handle_mouse(click);
+    assert!(app.output_focus);
+    assert!(!app.output_maximized);
+    app.handle_mouse(click);
+    assert!(app.output_maximized);
+    assert!(!app.output_follow);
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    app.handle_mouse(click);
+    app.handle_mouse(click);
+    assert!(!app.output_maximized);
+    assert!(app.output_focus);
+    assert!(!app.output_follow);
+  }
+
+  #[test]
+  fn stdout_double_click_requires_nearby_recent_clicks() {
+    let mut app = App::new("Slurm");
+    app.click_output(60, 4);
+    app.click_output(90, 10);
+    assert!(!app.output_maximized);
+    app.last_output_click = Some((90, 10, Instant::now() - Duration::from_millis(500)));
+    app.click_output(90, 10);
+    assert!(!app.output_maximized);
+    app.navigate(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+    app.click_output(90, 10);
+    assert!(!app.output_maximized);
+  }
+  #[test]
   fn enter_maximizes_stdout_and_escape_restores_without_losing_pause() {
     let backend = ratatui::backend::TestBackend::new(120, 30);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -1026,7 +1091,7 @@ mod tests {
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     assert!(!app.output_maximized);
     assert!(app.output_focus);
-    assert_eq!(app.panes.output.width, 60);
+    assert_eq!(app.panes.output.width, 54);
     assert_eq!(app.selected().unwrap().id, "1");
     assert!(!app.output_follow);
     app.navigate(enter);
@@ -1388,7 +1453,7 @@ mod tests {
     assert!(text.contains("Elapsed: 30:00 · Limit: UNLIMITED"));
   }
   #[test]
-  fn focused_details_scroll_and_only_escape_returns_to_jobs() {
+  fn focused_details_scroll_and_enter_returns_to_jobs() {
     let mut app = App::new("Slurm");
     app.replace_jobs(vec![job("1"), job("2")]);
     app.details = Some(("1".into(), "details\n".repeat(50)));
@@ -1410,14 +1475,13 @@ mod tests {
       KeyCode::Right,
       KeyCode::Char('/'),
       KeyCode::Char('s'),
-      KeyCode::Enter,
     ] {
       assert!(app.navigate(key(code)));
       assert!(app.details_focus);
       assert!(!app.output_focus);
       assert_eq!(app.selected().unwrap().id, "1");
     }
-    app.navigate(key(KeyCode::Esc));
+    app.navigate(key(KeyCode::Enter));
     assert!(!app.details_focus);
     assert!(app.details.is_none());
     app.navigate(key(KeyCode::Char('j')));

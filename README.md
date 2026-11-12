@@ -73,6 +73,7 @@ filter appears in the top border of the Jobs box. Shortcuts are listed in the po
 | Mouse wheel | Scroll the pane under the pointer, one line per event |
 | Left click | Select a job row or focus a pane; clicking another pane closes Details |
 | Double click job | Open and focus Details (two clicks on the same job within 400 ms) |
+| Double click stdout | Toggle maximized stdout / split layout |
 | ? | Open / close hotkey menu |
 | h / Left | Focus job list |
 | l / Right | Focus stdout |
@@ -81,7 +82,8 @@ filter appears in the top border of the Jobs box. Shortcuts are listed in the po
 | Enter / Esc while filtering | Finish editing |
 | s | Cycle ascending ID/name/state sort |
 | Enter | Fetch selected job details and focus that pane |
-| Enter (stdout focused) | Toggle maximized stdout / 50-50 split layout |
+| Enter (details focused) | Close Details and return to Jobs |
+| Enter (stdout focused) | Toggle maximized stdout / 55-45 split layout |
 | Esc / q (stdout maximized) | Restore split layout, keeping stdout focused |
 | Page Up / Page Down | Scroll details |
 | Tab / Shift-Tab | Switch jobs / stdout; disabled while details is focused |
@@ -135,7 +137,7 @@ jobspec total and per-slot task counts. Allocated tasks stay `—`
 when the scheduler does not explicitly report them; CPU counts are never used to
 guess how many tasks are running. Demo data includes MPI and threaded layouts.
 
-Details retains keyboard focus until `Esc`, `q`, or a click on Jobs/Stdout closes it. Pane-switching keys and
+Details retains keyboard focus until `Enter`, `Esc`, `q`, or a click on Jobs/Stdout closes it. Pane-switching keys and
 job/filter actions are ignored there; scrolling, help, refresh, and quitting
 remain available.
 
