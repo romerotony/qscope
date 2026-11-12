@@ -7,6 +7,11 @@ it does not discover nested instances or connect over SSH.
 
 ## Build and run
 
+Use Rust **1.88 or newer** with the current `Cargo.lock`. The 2024 edition
+requires Rust 1.85+, but locked dependencies raise the minimum to 1.88.
+This minimum is dependency-derived, not build-verified; a recent stable Rust
+toolchain is recommended.
+
 ```sh
 cargo build --release
 ./target/release/qscope
