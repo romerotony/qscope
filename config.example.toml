@@ -1,0 +1,3 @@
+scheduler = "auto" # auto, slurm, flux
+refresh_interval_secs = 10
+command_timeout_secs = 15
