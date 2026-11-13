@@ -1,4 +1,5 @@
 scheduler = "auto" # auto, slurm, flux
 refresh_interval_secs = 5
+resource_refresh_interval_secs = 30
 stdout_refresh_interval_secs = 1
 command_timeout_secs = 15

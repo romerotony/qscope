@@ -31,6 +31,9 @@ pub struct Args {
   /// Stdout polling interval in seconds (default 1, minimum 1)
   #[arg(long)]
   pub stdout_refresh: Option<u64>,
+  /// Resource polling interval in seconds (default 30, minimum 1)
+  #[arg(long)]
+  pub resource_refresh: Option<u64>,
 }
 
 /// Missing settings inherit defaults; unknown keys are rejected to catch typos.
@@ -40,6 +43,7 @@ pub struct Config {
   pub scheduler: Scheduler,
   pub refresh_interval_secs: u64,
   pub stdout_refresh_interval_secs: u64,
+  pub resource_refresh_interval_secs: u64,
   pub command_timeout_secs: u64,
 }
 
@@ -49,6 +53,7 @@ impl Default for Config {
       scheduler: Scheduler::Auto,
       refresh_interval_secs: 5,
       stdout_refresh_interval_secs: 1,
+      resource_refresh_interval_secs: 30,
       command_timeout_secs: 15,
     }
   }
@@ -84,7 +89,14 @@ impl Config {
     if let Some(refresh) = args.stdout_refresh {
       config.stdout_refresh_interval_secs = refresh;
     }
+    if let Some(refresh) = args.resource_refresh {
+      config.resource_refresh_interval_secs = refresh;
+    }
     // Reject zero to avoid an unbounded polling loop.
+    ensure!(
+      config.resource_refresh_interval_secs >= 1,
+      "Resource refresh interval must be at least 1 second"
+    );
     ensure!(
       config.stdout_refresh_interval_secs >= 1,
       "Stdout refresh interval must be at least 1 second"
@@ -114,10 +126,12 @@ mod tests {
       config: Some(file.path().to_path_buf()),
       refresh: None,
       stdout_refresh: None,
+      resource_refresh: None,
     };
     let defaults = Config::load(&args).unwrap();
     assert_eq!(defaults.refresh_interval_secs, 5);
     assert_eq!(defaults.stdout_refresh_interval_secs, 1);
+    assert_eq!(defaults.resource_refresh_interval_secs, 30);
     args.refresh = Some(0);
     assert!(Config::load(&args).is_err());
     args.refresh = Some(1);
@@ -130,6 +144,13 @@ mod tests {
     let config = Config::load(&args).unwrap();
     assert_eq!(config.stdout_refresh_interval_secs, 2);
     assert_eq!(config.refresh_interval_secs, 30);
+    args.resource_refresh = Some(0);
+    assert!(Config::load(&args).is_err());
+    args.resource_refresh = Some(60);
+    assert_eq!(
+      Config::load(&args).unwrap().resource_refresh_interval_secs,
+      60
+    );
   }
   #[test]
   fn config_defaults_and_validation() {
@@ -137,6 +158,7 @@ mod tests {
     assert_eq!(config.scheduler, Scheduler::Flux);
     assert_eq!(config.refresh_interval_secs, 5);
     assert_eq!(config.stdout_refresh_interval_secs, 1);
+    assert_eq!(config.resource_refresh_interval_secs, 30);
     assert!(toml::from_str::<Config>("scheduler = 'pbs'").is_err());
     assert!(toml::from_str::<Config>("typo = 1").is_err());
   }

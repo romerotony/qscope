@@ -57,7 +57,8 @@ Use `--config PATH` to specify a different file. CLI flags override config.
 
 ```toml
 scheduler = "auto" # auto | slurm | flux
-refresh_interval_secs = 5 # jobs/resources; minimum 1
+refresh_interval_secs = 5 # job list; minimum 1
+resource_refresh_interval_secs = 30 # selected-job resources; minimum 1
 stdout_refresh_interval_secs = 1 # file reads; minimum 1
 command_timeout_secs = 15
 ```
@@ -121,7 +122,7 @@ A panel below the job list follows the selected job, comparing **requested** and
 **allocated** nodes, CPUs/cores, GPUs, and memory. It also shows elapsed time,
 time limit and assigned hosts.
 Jobs and Resources format elapsed time as `MM:SS`, `HH:MM:SS`, or `D-HH:MM:SS`;
-pending jobs show `—`. It refreshes at the configured scheduler interval;
+pending jobs show `—`. Resources refresh at their own configured interval (30 seconds by default);
 `r` also requests a refresh. `Enter` temporarily replaces it with formatted job details;
 `Esc` (after returning focus from stdout, if needed) restores the resources view.
 
@@ -161,13 +162,15 @@ many terminals allow native text selection by holding Shift.
 
 The right-hand panel follows the selected job and refreshes its output at the
 stdout interval (one second by default) when the worker is available. Set it with
-`--stdout-refresh SECONDS` or `stdout_refresh_interval_secs`. Scheduler jobs and
-resources refresh every five seconds by default (`--refresh SECONDS` or
-`refresh_interval_secs`). Running elapsed clocks advance locally each second
+`--stdout-refresh SECONDS` or `stdout_refresh_interval_secs`. Scheduler jobs
+refresh every five seconds by default (`--refresh SECONDS` or `refresh_interval_secs`).
+Resources refresh every 30 seconds (`--resource-refresh SECONDS` or
+`resource_refresh_interval_secs`). Running elapsed clocks advance locally each second
 between snapshots without querying the scheduler. `r` requests an immediate
 refresh of all three; slow reads remain serialized and may stretch the cadence.
 The viewer resolves `StdOut` and `WorkDir` from
-`scontrol show job` and caches the path for the current job. It does not assume
+`scontrol show job` and shares its metadata with Resources. It keeps up to 32
+resolved paths for 60 seconds, rather than resolving again on each selection. It does not assume
 the default filename. Paths with spaces, relative paths, and unresolved `%j`,
 `%A`, `%a`, and `%%` patterns are supported; other unresolved patterns show a
 diagnostic instead of guessing. The file must be readable from the node running
@@ -191,7 +194,10 @@ you to resume following rather than mixing unrelated file contents.
 The view follows the newest lines until you navigate within stdout. Long lines are clipped
 to panel width. Invalid UTF-8 is replaced and control characters are stripped.
 File operations have a UI timeout, though a stalled network-filesystem operation
-may remain in the OS blocking pool until it returns. Live Flux stdout is not yet
+may remain in the OS blocking pool until it returns. Only one filesystem task is
+allowed in flight, even after a timeout; retries wait for it and back off up to
+60 seconds. Normal shutdown waits at most 200 ms for blocking work after terminal
+cleanup; this does not cancel a stalled OS syscall. Live Flux stdout is not yet
 supported; demo mode provides simulated logs for both scheduler styles.
 
 The job table uses fewer columns in narrow layouts; full fields remain available
@@ -214,6 +220,26 @@ through job details.
   or longer is preferable for large installations. Manual refreshes are coalesced.
 - No submission, historical accounting, stderr preview, resource-utilization
   sampling, or combined scheduler view in this initial version.
+
+## HPC load controls
+
+- Automatic selection requests wait for 250 ms of stable selection and are
+  dispatched no faster than once per second. Explicit Details and paging actions
+  remain responsive. Resources resolve first so stdout can reuse the same details.
+- Metadata has a 128-entry / 8 MiB cache budget. Dynamic job details expire at the
+  resource interval; Flux jobspec/allocation entries expire after 60 seconds.
+  Observed state, node/CPU-count, and name changes invalidate tracked jobs.
+  Cancellation invalidates the target; `r` bypasses metadata and path caches.
+  Failed metadata lookups are briefly cached to avoid repeated command failures.
+- Rendering formats only visible job rows, caches their formatted cells and clock
+  widths, and updates running clocks once per second. Idle polling ticks no longer
+  force five redraws per second. Input/resize/results still redraw promptly.
+
+Tests cover stalled-read tracking, bounded shutdown, cache expiry/invalidation,
+mock Slurm/Flux command counts, selection debounce, and a 100,000-job rendering
+case. These are functional/load-regression tests, not measured HPC benchmarks.
+Use your site's scheduler polling policy; `--refresh 30` is still recommended
+for large installations.
 
 ## Development
 

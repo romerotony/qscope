@@ -4,6 +4,7 @@
 mod config;
 mod details;
 mod duration;
+mod metadata;
 mod output;
 mod resources;
 mod scheduler;
@@ -44,6 +45,36 @@ enum Response {
   Resources(String, Result<Box<resources::Resources>>),
 }
 
+struct SelectionGate {
+  settled_at: Instant,
+  next_fetch: Instant,
+}
+
+impl SelectionGate {
+  fn new(now: Instant) -> Self {
+    Self {
+      settled_at: now,
+      next_fetch: now,
+    }
+  }
+  fn changed(&mut self, now: Instant) {
+    self.settled_at = now + Duration::from_millis(250);
+  }
+  fn settled(&self, now: Instant) -> bool {
+    now >= self.settled_at
+  }
+  fn ready(&self, now: Instant) -> bool {
+    self.settled(now) && now >= self.next_fetch
+  }
+  fn dispatched(&mut self, now: Instant) {
+    self.next_fetch = now + Duration::from_secs(1);
+  }
+  fn force(&mut self, now: Instant) {
+    self.settled_at = now;
+    self.next_fetch = now;
+  }
+}
+
 /// Restore terminal settings when leaving the UI, including on returned errors.
 struct TerminalGuard;
 impl Drop for TerminalGuard {
@@ -53,8 +84,19 @@ impl Drop for TerminalGuard {
   }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+  let runtime = tokio::runtime::Builder::new_multi_thread()
+    .enable_all()
+    .max_blocking_threads(2)
+    .build()?;
+  let result = runtime.block_on(async_main());
+  // A stalled NFS syscall cannot be canceled. Do not wait indefinitely for the
+  // single tracked blocking read after the terminal has been restored.
+  runtime.shutdown_timeout(Duration::from_millis(200));
+  result
+}
+
+async fn async_main() -> Result<()> {
   let args = Args::parse();
   let config = Config::load(&args)?;
   ensure!(
@@ -94,32 +136,56 @@ async fn main() -> Result<()> {
 async fn run(mut backend: Source, config: &Config) -> Result<()> {
   // Bounded channels and the `busy` flag prevent overlapping scheduler calls
   // and unbounded queues of refresh requests.
-  let (requests, mut work) = mpsc::channel::<Request>(1);
+  let (requests, mut work) = mpsc::channel::<(u64, Request)>(1);
   let (results, mut responses) = mpsc::channel(1);
   let name = backend.name();
+  let resource_interval = Duration::from_secs(config.resource_refresh_interval_secs);
   let worker = tokio::spawn(async move {
     let mut output_reader = output::Reader::default();
-    while let Some(request) = work.recv().await {
+    let mut cache = metadata::Metadata::new(resource_interval);
+    let mut generation = 0;
+    while let Some((requested_generation, request)) = work.recv().await {
+      if generation != requested_generation {
+        cache.clear();
+        output_reader.clear_paths();
+        generation = requested_generation;
+      }
       let response = match request {
-        Request::Jobs => Response::Jobs(backend.jobs().await),
+        Request::Jobs => {
+          let result = backend.jobs().await;
+          if let Ok(jobs) = &result {
+            for id in cache.observe(jobs) {
+              output_reader.invalidate(&id);
+            }
+          }
+          Response::Jobs(result)
+        }
         Request::Details(id) => {
-          let result = backend.details(&id).await;
+          let result = backend.details(&id, &mut cache).await;
           Response::Details(id, result)
         }
         Request::Cancel(id) => {
           let result = backend.cancel(&id).await;
+          cache.invalidate(&id);
+          output_reader.invalidate(&id);
           Response::Cancel(id, result)
         }
         Request::Output(id, position, revision) => {
-          let result = backend.output(&id, &mut output_reader, position).await;
+          let result = backend
+            .output(&id, &mut output_reader, position, &mut cache)
+            .await;
           Response::Output(id, position, revision, result)
         }
         Request::Resources(id) => {
-          let result = backend.resources(&id).await.map(Box::new);
+          let result = backend.resources(&id, &mut cache).await.map(Box::new);
           Response::Resources(id, result)
         }
       };
-      if results.send(response).await.is_err() {
+      if results
+        .send((requested_generation, response))
+        .await
+        .is_err()
+      {
         break;
       }
     }
@@ -138,12 +204,18 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
   let mut next_resources = Instant::now();
   let mut busy = false;
   let mut refresh_needed = true;
+  let mut generation = 0u64;
+  let mut selection_gate = SelectionGate::new(Instant::now());
+  let mut dirty = true;
+  let clock_started = Instant::now();
+  let mut last_clock_second = 0;
   let result: Result<()> = async {
         loop {
             let selected_id = app.selected().map(|job| job.id.clone());
             if selected_id != app.output_id {
                 app.output_id = selected_id.clone();
                 app.reset_output();
+                dirty = true;
                 next_output = Instant::now();
                 app.resources = None;
                 app.resources_updated = None;
@@ -153,52 +225,77 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
                     app.details_request = None;
                 }
                 next_resources = Instant::now();
+                selection_gate.changed(Instant::now());
             }
             if !busy && let Some(id) = app.details_request.take()
                 && app.details.as_ref().is_some_and(|(job, _)| job == &id)
                 && app.selected().is_some_and(|job| job.id == id) {
-                requests.send(Request::Details(id)).await?;
+                requests.send((generation, Request::Details(id))).await?;
                 busy = true;
             }
             if !busy && app.confirm.is_none()
                 && let Some(id) = selected_id.clone()
                 && let Some(position) = app.output_request.take() {
-                requests.send(Request::Output(id, position, app.output_revision)).await?;
+                requests.send((generation, Request::Output(id, position, app.output_revision))).await?;
                 busy = true;
             }
             // Pause refreshes during confirmation and capture the target ID
             // separately, so a changing job list cannot change what gets canceled.
             if !busy && app.confirm.is_none() && (refresh_needed || Instant::now() >= next_refresh) {
-                requests.send(Request::Jobs).await?;
+                requests.send((generation, Request::Jobs)).await?;
                 busy = true;
                 refresh_needed = false;
             }
             if !busy && app.confirm.is_none() && Instant::now() >= next_resources
+                && selection_gate.ready(Instant::now())
                 && let Some(id) = selected_id.clone() {
-                requests.send(Request::Resources(id)).await?;
+                requests.send((generation, Request::Resources(id))).await?;
                 busy = true;
+                selection_gate.dispatched(Instant::now());
             }
             if !busy && app.confirm.is_none() && Instant::now() >= next_output
+                && selection_gate.settled(Instant::now()) && app.resources.is_some()
                 && let Some(id) = selected_id {
-                requests.send(Request::Output(id, output::Position::Tail, app.output_revision)).await?;
+                requests.send((generation, Request::Output(id, output::Position::Tail, app.output_revision))).await?;
                 busy = true;
                 // File polling is independent of scheduler polling. The resolved
                 // path is cached so file refreshes do not query Slurm again.
                 next_output = Instant::now() + Duration::from_secs(config.stdout_refresh_interval_secs);
             }
-            terminal.draw(|frame| ui::draw(frame, &mut app))?;
+            let second = clock_started.elapsed().as_secs();
+            if second != last_clock_second {
+                last_clock_second = second;
+                dirty |= app.has_running_clock();
+            }
+            if dirty {
+                terminal.draw(|frame| ui::draw(frame, &mut app))?;
+                dirty = false;
+            }
             tokio::select! {
                 _ = tick.tick() => {},
                 signal = tokio::signal::ctrl_c() => { signal?; break; },
                 response = responses.recv() => {
+                    dirty = true;
                     busy = false;
-                    match response.context("Scheduler worker stopped")? {
+                    let (response_generation, response) = response.context("Scheduler worker stopped")?;
+                    if response_generation != generation { continue; }
+                    match response {
                         Response::Jobs(result) => {
                             // Wait a full interval after completion, including
                             // failures, rather than hammering a slow controller.
                             next_refresh = Instant::now() + Duration::from_secs(config.refresh_interval_secs);
                             match result {
-                                Ok(jobs) => { app.replace_jobs(jobs); app.status = "Connected".into(); }
+                                Ok(jobs) => {
+                                    let previous = app.selected().map(|job| (job.id.clone(), job.state.clone(), job.nodes.clone(), job.cores.clone()));
+                                    app.replace_jobs(jobs);
+                                    let current = app.selected().map(|job| (job.id.clone(), job.state.clone(), job.nodes.clone(), job.cores.clone()));
+                                    if current != previous {
+                                        app.resources = None;
+                                        app.resources_updated = None;
+                                        next_resources = Instant::now();
+                                    }
+                                    app.status = "Connected".into();
+                                }
                                 Err(error) => app.status = format!("Refresh failed; showing last snapshot: {error:#}"),
                             }
                         }
@@ -240,7 +337,7 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
                             if app.selected().is_some_and(|job| job.id == id) {
                                 app.resources = Some((id, result.map(|resources| *resources).map_err(|error| format!("Resources unavailable: {error:#}"))));
                                 app.resources_updated = Some(Instant::now());
-                                next_resources = Instant::now() + Duration::from_secs(config.refresh_interval_secs);
+                                next_resources = Instant::now() + Duration::from_secs(config.resource_refresh_interval_secs);
                             }
                         }
                     }
@@ -248,8 +345,17 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
                 event = events.next() => {
                     let Some(event) = event else { break; };
                     let key = match event? {
-                        Event::Key(key) => key,
-                        Event::Mouse(mouse) => { app.handle_mouse(mouse); continue; }
+                        Event::Key(key) => { dirty = true; key },
+                        Event::Mouse(mouse) => {
+                            if matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollUp
+                                | crossterm::event::MouseEventKind::ScrollDown
+                                | crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)) {
+                                app.handle_mouse(mouse);
+                                dirty = true;
+                            }
+                            continue;
+                        }
+                        Event::Resize(_, _) => { dirty = true; continue; }
                         _ => continue,
                     };
                     if key.kind != KeyEventKind::Press { continue; }
@@ -259,7 +365,7 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
                     if let Some(id) = app.confirm.clone() {
                         match key.code {
                             KeyCode::Char('y') if !busy => {
-                                requests.send(Request::Cancel(id)).await?;
+                                requests.send((generation, Request::Cancel(id))).await?;
                                 busy = true;
                                 app.confirm = None;
                             }
@@ -286,7 +392,16 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
                         KeyCode::PageDown => app.detail_scroll = app.detail_scroll.saturating_add(10),
                         KeyCode::PageUp => app.detail_scroll = app.detail_scroll.saturating_sub(10),
                         KeyCode::Char('s') => { app.sort = (app.sort + 1) % 3; app.rebuild(None); },
-                        KeyCode::Char('r') => { refresh_needed = true; next_output = Instant::now(); next_resources = Instant::now(); },
+                        KeyCode::Char('r') => {
+                            generation = generation.wrapping_add(1);
+                            refresh_needed = true;
+                            next_output = Instant::now();
+                            next_resources = Instant::now();
+                            selection_gate.force(Instant::now());
+                            if app.details_focus && let Some(job) = app.selected() {
+                                app.details_request = Some(job.id.clone());
+                            }
+                        },
                         KeyCode::Enter => app.open_details(),
                         KeyCode::Char('c') if !busy => {
                             if let Some(job) = app.selected() { app.confirm = Some(job.id.clone()); }
@@ -306,3 +421,47 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
 }
 
 use anyhow::Context;
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn selection_requests_debounce_and_rate_limit_without_sleeping() {
+    let now = Instant::now();
+    let mut gate = SelectionGate::new(now);
+    for i in 0..20 {
+      let at = now + Duration::from_millis(i * 50);
+      gate.changed(at);
+      assert!(!gate.ready(at + Duration::from_millis(249)));
+    }
+    let settled = now + Duration::from_millis(1200);
+    assert!(gate.ready(settled));
+    gate.dispatched(settled);
+    gate.changed(settled + Duration::from_millis(10));
+    assert!(!gate.ready(settled + Duration::from_millis(300)));
+    assert!(gate.ready(settled + Duration::from_secs(1)));
+    gate.force(settled);
+    assert!(gate.ready(settled));
+  }
+
+  #[test]
+  fn shutdown_is_bounded_even_with_an_uncancelable_blocking_task() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+      .enable_all()
+      .build()
+      .unwrap();
+    let (release, wait) = std::sync::mpsc::channel();
+    let (started, ready) = std::sync::mpsc::channel();
+    runtime.spawn_blocking(move || {
+      let _ = started.send(());
+      let _ = wait.recv();
+    });
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    let start = Instant::now();
+    runtime.shutdown_timeout(Duration::from_millis(20));
+    let elapsed = start.elapsed();
+    let _ = release.send(());
+    assert!(elapsed < Duration::from_secs(1));
+  }
+}

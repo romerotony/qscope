@@ -11,6 +11,7 @@ use ratatui::{
   text::{Line, Span, Text},
   widgets::{Block, BorderType, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -24,6 +25,11 @@ pub struct App {
   pub visible: Vec<usize>,
   search: Search,
   matches: Vec<Option<JobMatch>>,
+  row_cache: HashMap<usize, CachedRow>,
+  max_running_seconds: Option<u64>,
+  static_elapsed_width: usize,
+  #[cfg(test)]
+  row_builds: usize,
   pub table: TableState,
   pub query: String,
   pub searching: bool,
@@ -77,6 +83,13 @@ struct PaneAreas {
   help: Rect,
 }
 
+struct CachedRow {
+  compact: bool,
+  searching: bool,
+  second: u64,
+  row: Row<'static>,
+}
+
 impl App {
   pub fn new(backend: &'static str) -> Self {
     Self {
@@ -86,6 +99,11 @@ impl App {
       visible: vec![],
       search: Search::default(),
       matches: vec![],
+      row_cache: HashMap::new(),
+      max_running_seconds: None,
+      static_elapsed_width: 8,
+      #[cfg(test)]
+      row_builds: 0,
       table: TableState::default(),
       query: String::new(),
       searching: false,
@@ -143,6 +161,89 @@ impl App {
       self.jobs_updated.elapsed().as_secs(),
     )
   }
+
+  pub fn has_running_clock(&self) -> bool {
+    self.max_running_seconds.is_some()
+  }
+
+  fn elapsed_width(&self) -> u16 {
+    let running_width = self.max_running_seconds.map_or(0, |seconds| {
+      crate::duration::clock(seconds.saturating_add(self.jobs_updated.elapsed().as_secs())).len()
+    });
+    self
+      .static_elapsed_width
+      .max(running_width)
+      .min(u16::MAX as usize) as u16
+  }
+
+  fn job_row(&mut self, index: usize, compact: bool) -> Row<'static> {
+    let job = &self.jobs[index];
+    let second = if matches!(job.state.as_str(), "RUN" | "RUNNING") {
+      self.jobs_updated.elapsed().as_secs()
+    } else {
+      0
+    };
+    if let Some(cached) = self.row_cache.get(&index)
+      && cached.compact == compact
+      && cached.searching == self.searching
+      && cached.second == second
+    {
+      return cached.row.clone();
+    }
+    let elapsed = self.job_elapsed(job);
+    let color = match job.state.as_str() {
+      "RUNNING" | "RUN" => Color::Green,
+      "PENDING" | "SCHED" | "DEPEND" | "PRIORITY" => Color::Yellow,
+      "FAILED" | "CANCELLED" | "CANCELED" => Color::Red,
+      _ => Color::White,
+    };
+    let cells = if compact {
+      vec![
+        (&job.id, Some(0)),
+        (&job.name, Some(1)),
+        (&job.state, Some(2)),
+        (&elapsed, None),
+      ]
+    } else {
+      vec![
+        (&job.id, Some(0)),
+        (&job.name, Some(1)),
+        (&job.state, Some(2)),
+        (&job.queue, Some(3)),
+        (&elapsed, None),
+        (&job.reason, Some(5)),
+      ]
+    };
+    let matched = self
+      .matches
+      .get(index)
+      .and_then(Option::as_ref)
+      .filter(|_| self.searching);
+    let row = Row::new(cells.into_iter().map(|(text, field)| {
+      let indices = field
+        .and_then(|field| matched.map(|m| m.indices[field].as_slice()))
+        .unwrap_or(&[]);
+      fuzzy_cell(text, indices)
+    }))
+    .style(Style::default().fg(color));
+    if self.row_cache.len() >= 512 {
+      self.row_cache.clear();
+    }
+    self.row_cache.insert(
+      index,
+      CachedRow {
+        compact,
+        searching: self.searching,
+        second,
+        row: row.clone(),
+      },
+    );
+    #[cfg(test)]
+    {
+      self.row_builds += 1;
+    }
+    row
+  }
   /// Recompute visible indices; select the first match if no ID is preserved.
   pub fn rebuild(&mut self, preserve: Option<String>) {
     self.matches = self.search.rank(&self.jobs, &self.query);
@@ -174,6 +275,26 @@ impl App {
         },
       }
     });
+    // Compute width statistics once per snapshot/filter/sort, not per redraw.
+    self.row_cache.clear();
+    self.max_running_seconds = None;
+    self.static_elapsed_width = 8;
+    for &index in &self.visible {
+      let job = &self.jobs[index];
+      if matches!(job.state.as_str(), "RUN" | "RUNNING")
+        && let Some(seconds) = crate::duration::seconds(&job.runtime)
+      {
+        self.max_running_seconds = Some(
+          self
+            .max_running_seconds
+            .map_or(seconds, |old| old.max(seconds)),
+        );
+      } else {
+        self.static_elapsed_width = self
+          .static_elapsed_width
+          .max(self.job_elapsed(job).chars().count());
+      }
+    }
     let selected = preserve
       .and_then(|id| self.visible.iter().position(|&i| self.jobs[i].id == id))
       .unwrap_or(0);
@@ -699,59 +820,41 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
   app.panes.output = columns[1];
   // Keep the primary fields legible when stdout takes half the screen.
   let compact = columns[0].width < 100;
-  // Day-prefixed clocks need more than the usual eight characters.
-  let elapsed_width = app
-    .visible
-    .iter()
-    .map(|&i| app.job_elapsed(&app.jobs[i]).chars().count())
-    .max()
-    .unwrap_or(8)
-    .max(8) as u16;
-  let rows: Vec<Row> = app
-    .visible
-    .iter()
-    .map(|&i| {
-      let j = &app.jobs[i];
-      let elapsed = app.job_elapsed(j);
-      let color = match j.state.as_str() {
-        "RUNNING" | "RUN" => Color::Green,
-        "PENDING" | "SCHED" | "DEPEND" | "PRIORITY" => Color::Yellow,
-        "FAILED" | "CANCELLED" | "CANCELED" => Color::Red,
-        _ => Color::White,
-      };
-      let cells = if compact {
-        vec![
-          (&j.id, Some(0)),
-          (&j.name, Some(1)),
-          (&j.state, Some(2)),
-          (&elapsed, None),
-        ]
-      } else {
-        vec![
-          (&j.id, Some(0)),
-          (&j.name, Some(1)),
-          (&j.state, Some(2)),
-          (&j.queue, Some(3)),
-          (&elapsed, None),
-          (&j.reason, Some(5)),
-        ]
-      };
-      // Keep fuzzy filtering/ranking after Enter, but only emphasize matching
-      // letters while the search field is actively being edited.
-      let matched = app
-        .matches
-        .get(i)
-        .and_then(Option::as_ref)
-        .filter(|_| app.searching);
-      Row::new(cells.into_iter().map(|(text, field)| {
-        let indices = field
-          .and_then(|field| matched.map(|m| m.indices[field].as_slice()))
-          .unwrap_or(&[]);
-        fuzzy_cell(text, indices)
-      }))
-      .style(Style::default().fg(color))
-    })
+  let elapsed_width = app.elapsed_width();
+  // Keep global selection/offsets for input, but give Ratatui only viewport rows.
+  // The local table state must not overwrite the global filtered-list indices.
+  let height = usize::from(app.panes.job_rows.height);
+  let count = app.visible.len();
+  if let Some(selected) = app.table.selected() {
+    if count == 0 {
+      app.table.select(None);
+    } else if selected >= count {
+      app.table.select(Some(count - 1));
+    }
+  }
+  let mut start = app.table.offset().min(count.saturating_sub(height.max(1)));
+  if let Some(selected) = app.table.selected() {
+    if selected < start {
+      start = selected;
+    } else if selected >= start + height.max(1) {
+      start = selected + 1 - height.max(1);
+    }
+  }
+  *app.table.offset_mut() = start;
+  let end = (start + height).min(count);
+  let indices: Vec<_> = app.visible[start..end].to_vec();
+  let rows: Vec<_> = indices
+    .into_iter()
+    .map(|index| app.job_row(index, compact))
     .collect();
+  let mut viewport_state = TableState::default();
+  viewport_state.select(
+    app
+      .table
+      .selected()
+      .and_then(|index| index.checked_sub(start))
+      .filter(|&index| index < end - start),
+  );
   let table = Table::new(
     rows,
     if compact {
@@ -803,7 +906,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
       .fg(Color::Cyan)
       .add_modifier(Modifier::BOLD),
   ));
-  frame.render_stateful_widget(table, panels[0], &mut app.table);
+  frame.render_stateful_widget(table, panels[0], &mut viewport_state);
   if let Some((id, text)) = &app.details {
     frame.render_widget(
       Paragraph::new(Text::from(
@@ -1109,6 +1212,35 @@ fn centered(area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
   use super::*;
+  #[test]
+  fn large_array_formats_only_viewport_rows_and_reuses_them() {
+    let backend = ratatui::backend::TestBackend::new(180, 40);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    let mut app = App::new("Slurm");
+    app.sort = 0;
+    let jobs = (0..100_000)
+      .map(|id| {
+        let mut job = job(&id.to_string());
+        job.state = "COMPLETED".into();
+        job
+      })
+      .collect();
+    app.replace_jobs(jobs);
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let first_builds = app.row_builds;
+    let height = usize::from(app.panes.job_rows.height);
+    assert!(first_builds > 0 && first_builds <= height);
+    for _ in 0..20 {
+      terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    }
+    assert_eq!(app.row_builds, first_builds);
+    app.table.select(Some(99_999));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    assert!(app.row_builds <= first_builds + height);
+    assert!(app.table.offset() > 99_900);
+    assert_eq!(app.selected().unwrap().id, "99999");
+    assert!(app.row_cache.len() <= 512);
+  }
   #[test]
   fn cached_jobs_tick_locally_and_new_snapshots_reset_the_clock() {
     let mut app = App::new("Slurm");

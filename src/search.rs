@@ -28,6 +28,17 @@ impl Default for Search {
 
 impl Search {
   pub fn rank(&mut self, jobs: &[Job], query: &str) -> Vec<Option<JobMatch>> {
+    if query.trim().is_empty() {
+      return jobs
+        .iter()
+        .map(|_| {
+          Some(JobMatch {
+            score: 0,
+            indices: std::array::from_fn(|_| Vec::new()),
+          })
+        })
+        .collect();
+    }
     // Literal fuzzy words: punctuation does not enable hidden query operators.
     let pattern = Pattern::new(
       query,

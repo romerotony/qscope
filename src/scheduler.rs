@@ -30,32 +30,13 @@ pub struct Backend {
 }
 
 impl Backend {
-  /// Resolve requests from jobspec/TRES and allocations from the scheduler's
-  /// allocation record, never from a utilization estimate.
-  pub async fn resources(&self, id: &str) -> Result<crate::resources::Resources> {
-    let details = self.details(id).await?;
-    if self.kind == Scheduler::Slurm {
-      return crate::resources::slurm(&details);
-    }
-    let spec = self.run("flux", &["job", "info", id, "jobspec"]).await?;
-    let job: Value = serde_json::from_str(&details)?;
-    let allocation = if matches!(job["state"].as_str(), Some("RUN" | "CLEANUP" | "INACTIVE")) {
-      Some(self.run("flux", &["job", "info", id, "R"]).await)
-    } else {
-      None
-    };
-    let mut resources = crate::resources::flux(
-      &details,
-      &spec,
-      allocation
-        .as_ref()
-        .and_then(|r| r.as_ref().ok())
-        .map(String::as_str),
-    )?;
-    if let Some(Err(error)) = allocation {
-      resources.note = format!("Allocation unavailable: {error:#}. No utilization sampled.");
-    }
-    Ok(resources)
+  pub async fn info(&self, id: &str, attribute: &str) -> Result<String> {
+    validate_id(id)?;
+    ensure!(
+      self.kind == Scheduler::Flux && matches!(attribute, "jobspec" | "R"),
+      "Unsupported job attribute"
+    );
+    self.run("flux", &["job", "info", id, attribute]).await
   }
 
   pub fn name(&self) -> &'static str {

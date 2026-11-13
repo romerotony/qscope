@@ -3,10 +3,11 @@
 
 use anyhow::{Context, Result, ensure};
 use std::{
+  collections::VecDeque,
   fs::File,
   io::{Read, Seek, SeekFrom},
   path::{Path, PathBuf},
-  time::Duration,
+  time::{Duration, Instant},
 };
 
 const MAX_BYTES: u64 = 64 * 1024;
@@ -36,50 +37,121 @@ pub struct Output {
   pub page: Option<Page>,
 }
 
-#[derive(Default)]
 pub struct Reader {
-  // Cache only successful resolutions for the current job; retries can recover
-  // when a pending job gains output metadata. Files are reopened on each read
-  // to handle replacement, truncation, and creation after the job starts.
-  cached: Option<(String, PathBuf)>,
+  cached: VecDeque<(String, PathBuf, Instant)>,
+  in_flight: Option<tokio::task::JoinHandle<Result<(String, Page)>>>,
+  timeout: Duration,
+  failures: u32,
+  retry_at: Option<Instant>,
+  last_path: Option<PathBuf>,
+}
+
+impl Default for Reader {
+  fn default() -> Self {
+    Self {
+      cached: VecDeque::new(),
+      in_flight: None,
+      timeout: Duration::from_secs(3),
+      failures: 0,
+      retry_at: None,
+      last_path: None,
+    }
+  }
 }
 
 impl Reader {
   pub fn path(&self, id: &str) -> Option<PathBuf> {
     self
       .cached
-      .as_ref()
-      .filter(|(job, _)| job == id)
-      .map(|(_, path)| path.clone())
+      .iter()
+      .find(|(job, _, at)| job == id && at.elapsed() < Duration::from_secs(60))
+      .map(|(_, path, _)| path.clone())
   }
 
   pub fn remember(&mut self, id: &str, path: PathBuf) {
-    self.cached = Some((id.into(), path));
+    self.invalidate(id);
+    if self.cached.len() == 32 {
+      self.cached.pop_front();
+    }
+    self.cached.push_back((id.into(), path, Instant::now()));
+  }
+
+  pub fn invalidate(&mut self, id: &str) {
+    self.cached.retain(|(job, _, _)| job != id);
+  }
+
+  pub fn clear_paths(&mut self) {
+    self.cached.clear();
+    // Never discard the outstanding filesystem task, even on manual refresh.
+  }
+
+  pub async fn read(&mut self, path: PathBuf, position: Position) -> Result<Output> {
+    let source = path.clone();
+    self.read_task(path, move || page(&source, position)).await
+  }
+
+  async fn read_task<F>(&mut self, path: PathBuf, task: F) -> Result<Output>
+  where
+    F: FnOnce() -> Result<(String, Page)> + Send + 'static,
+  {
+    if let Some(pending) = &self.in_flight {
+      ensure!(
+        pending.is_finished(),
+        "A previous stdout read is still blocked; waiting without starting another"
+      );
+      // The timed-out result belongs to an old request. Drain it, never display it.
+      let _ = self.in_flight.take().unwrap().await;
+    }
+    if self.last_path.as_ref() != Some(&path) {
+      self.failures = 0;
+      self.retry_at = None;
+      self.last_path = Some(path.clone());
+    }
+    ensure!(
+      self.retry_at.is_none_or(|at| Instant::now() >= at),
+      "Stdout reads are backing off after a filesystem failure"
+    );
+    self.in_flight = Some(tokio::task::spawn_blocking(task));
+    let result = tokio::time::timeout(self.timeout, self.in_flight.as_mut().unwrap()).await;
+    let result = match result {
+      Ok(result) => {
+        self.in_flight.take();
+        result
+          .context("Stdout read task failed")
+          .and_then(|value| value)
+      }
+      Err(_) => Err(anyhow::anyhow!(
+        "Output filesystem read timed out; the outstanding read is still tracked"
+      )),
+    };
+    match result {
+      Ok((text, page)) => {
+        self.failures = 0;
+        self.retry_at = None;
+        Ok(Output {
+          path: path.display().to_string(),
+          text,
+          page: Some(page),
+        })
+      }
+      Err(error) => {
+        self.failures = self.failures.saturating_add(1);
+        let delay = (1u64 << self.failures.min(6)).min(60);
+        self.retry_at = Some(Instant::now() + Duration::from_secs(delay));
+        Err(error).with_context(|| format!("Cannot read {}; backing off {delay}s", path.display()))
+      }
+    }
   }
 }
 
+#[cfg(test)]
 pub async fn read(path: PathBuf) -> Result<Output> {
   read_page(path, Position::Tail).await
 }
 
+#[cfg(test)]
 pub async fn read_page(path: PathBuf, position: Position) -> Result<Output> {
-  let display = path.display().to_string();
-  // Filesystem calls (including network-mounted paths) must not block drawing.
-  // A timed-out OS read can remain in the blocking pool until the OS returns.
-  let (text, page) = tokio::time::timeout(
-    Duration::from_secs(3),
-    tokio::task::spawn_blocking(move || page(&path, position)),
-  )
-  .await
-  .context("Output filesystem read timed out")??
-  .with_context(|| {
-    format!("Cannot read {display}; it may not exist yet or be accessible on this node")
-  })?;
-  Ok(Output {
-    path: display,
-    text,
-    page: Some(page),
-  })
+  Reader::default().read(path, position).await
 }
 
 fn page(path: &Path, position: Position) -> Result<(String, Page)> {
@@ -202,6 +274,83 @@ pub fn slurm_path(details: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[tokio::test]
+  async fn timed_out_reads_remain_tracked_and_never_overlap() {
+    use std::sync::{
+      Arc,
+      atomic::{AtomicUsize, Ordering},
+      mpsc,
+    };
+    let count = Arc::new(AtomicUsize::new(0));
+    let (release, wait) = mpsc::channel();
+    let mut reader = Reader {
+      timeout: Duration::from_millis(20),
+      ..Default::default()
+    };
+    let calls = count.clone();
+    let first = reader
+      .read_task(PathBuf::from("/stalled"), move || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        let _ = wait.recv();
+        anyhow::bail!("released simulated stalled read")
+      })
+      .await;
+    let mut retries_failed = true;
+    for _ in 0..50 {
+      let calls = count.clone();
+      retries_failed &= reader
+        .read_task(PathBuf::from("/different"), move || {
+          calls.fetch_add(1, Ordering::SeqCst);
+          anyhow::bail!("unexpected overlapping read")
+        })
+        .await
+        .is_err();
+    }
+    reader.clear_paths();
+    let tracked = reader.in_flight.is_some();
+    let count_before_release = count.load(Ordering::SeqCst);
+    // Always release before assertions so a failed test cannot hang its runtime.
+    release.send(()).unwrap();
+    let _ = reader.in_flight.take().unwrap().await;
+    assert!(first.is_err());
+    assert!(retries_failed && tracked);
+    assert_eq!(count_before_release, 1);
+    assert_eq!(reader.failures, 1);
+    assert!(
+      reader
+        .read_task(PathBuf::from("/stalled"), || anyhow::bail!("must back off"))
+        .await
+        .is_err()
+    );
+    assert!(reader.in_flight.is_none());
+    reader.retry_at = None;
+    assert!(
+      reader
+        .read_task(PathBuf::from("/stalled"), || anyhow::bail!(
+          "second failure"
+        ))
+        .await
+        .is_err()
+    );
+    assert_eq!(reader.failures, 2);
+    assert!(reader.retry_at.unwrap() > Instant::now() + Duration::from_secs(3));
+  }
+
+  #[test]
+  fn path_cache_is_bounded_and_invalidated_explicitly() {
+    let mut reader = Reader::default();
+    for i in 0..40 {
+      reader.remember(&i.to_string(), PathBuf::from(format!("/{i}")));
+    }
+    assert_eq!(reader.cached.len(), 32);
+    assert!(reader.path("0").is_none());
+    assert!(reader.path("39").is_some());
+    reader.invalidate("39");
+    assert!(reader.path("39").is_none());
+    reader.cached.back_mut().unwrap().2 = Instant::now() - Duration::from_secs(61);
+    assert!(reader.path("38").is_none());
+  }
 
   #[tokio::test]
   async fn pages_cover_entire_large_file_in_both_directions() {

@@ -2,6 +2,7 @@
 
 use crate::{
   config::Scheduler,
+  metadata::Metadata,
   output::{self, Output, Reader},
   scheduler::{Backend, Job},
 };
@@ -16,9 +17,13 @@ pub enum Source {
 }
 
 impl Source {
-  pub async fn resources(&mut self, id: &str) -> Result<crate::resources::Resources> {
+  pub async fn resources(
+    &mut self,
+    id: &str,
+    cache: &mut Metadata,
+  ) -> Result<crate::resources::Resources> {
     match self {
-      Self::Live(backend) => backend.resources(id).await,
+      Self::Live(backend) => cache.resources(backend, id).await,
       Self::Demo(demo) => {
         demo.jobs();
         let job = demo
@@ -70,22 +75,19 @@ impl Source {
     id: &str,
     reader: &mut Reader,
     position: output::Position,
+    cache: &mut Metadata,
   ) -> Result<Output> {
     match self {
       Self::Live(backend) if backend.kind == Scheduler::Slurm => {
         let path = match reader.path(id) {
           Some(path) => path,
           None => {
-            let path = output::slurm_path(&backend.details(id).await?)?;
+            let path = output::slurm_path(&cache.details(backend, id, false).await?)?;
             reader.remember(id, path.clone());
             path
           }
         };
-        if position == output::Position::Tail {
-          output::read(path).await
-        } else {
-          output::read_page(path, position).await
-        }
+        reader.read(path, position).await
       }
       Self::Live(_) => bail!("Stdout preview currently supports Slurm only"),
       Self::Demo(demo) => {
@@ -141,9 +143,9 @@ impl Source {
     }
   }
 
-  pub async fn details(&mut self, id: &str) -> Result<String> {
+  pub async fn details(&mut self, id: &str, cache: &mut Metadata) -> Result<String> {
     let (kind, raw) = match self {
-      Self::Live(backend) => (backend.kind, backend.details(id).await?),
+      Self::Live(backend) => (backend.kind, cache.details(backend, id, true).await?),
       Self::Demo(demo) => (demo.kind, demo.details(id)?),
     };
     match kind {
@@ -320,17 +322,28 @@ mod tests {
     for kind in [Scheduler::Slurm, Scheduler::Flux] {
       let mut source = Source::demo(kind);
       let jobs = source.jobs().await.unwrap();
-      let running = source.resources(&jobs[0].id).await.unwrap();
+      let running = source
+        .resources(&jobs[0].id, &mut Metadata::default())
+        .await
+        .unwrap();
       assert_eq!(running.requested.cpus.as_deref(), Some("128"));
       assert_eq!(running.requested.tasks.as_deref(), Some("32"));
       assert_eq!(running.allocated.tasks.as_deref(), Some("32"));
       assert_eq!(running.allocated.cpus.as_deref(), Some("128"));
-      let pending = source.resources(&jobs[2].id).await.unwrap();
+      let pending = source
+        .resources(&jobs[2].id, &mut Metadata::default())
+        .await
+        .unwrap();
       assert!(pending.requested.cpus.is_some());
       assert!(pending.allocated.cpus.is_none());
       assert!(pending.allocated.tasks.is_none());
       assert!(pending.hosts.is_none());
-      assert!(source.resources("unknown").await.is_err());
+      assert!(
+        source
+          .resources("unknown", &mut Metadata::default())
+          .await
+          .is_err()
+      );
     }
   }
 
@@ -341,14 +354,24 @@ mod tests {
       let jobs = source.jobs().await.unwrap();
       let mut reader = Reader::default();
       let output = source
-        .output(&jobs[0].id, &mut reader, output::Position::Tail)
+        .output(
+          &jobs[0].id,
+          &mut reader,
+          output::Position::Tail,
+          &mut Metadata::default(),
+        )
         .await
         .unwrap();
       assert!(output.path.starts_with("DEMO"));
       assert!(output.text.contains("step 001"));
       assert!(
         source
-          .output(&jobs[2].id, &mut reader, output::Position::Tail)
+          .output(
+            &jobs[2].id,
+            &mut reader,
+            output::Position::Tail,
+            &mut Metadata::default()
+          )
           .await
           .unwrap()
           .text
@@ -356,7 +379,12 @@ mod tests {
       );
       assert!(
         source
-          .output("unknown", &mut reader, output::Position::Tail)
+          .output(
+            "unknown",
+            &mut reader,
+            output::Position::Tail,
+            &mut Metadata::default()
+          )
           .await
           .is_err()
       );
@@ -370,7 +398,12 @@ mod tests {
       timeout: std::time::Duration::from_millis(1),
     });
     let error = source
-      .output("1", &mut Reader::default(), output::Position::Tail)
+      .output(
+        "1",
+        &mut Reader::default(),
+        output::Position::Tail,
+        &mut Metadata::default(),
+      )
       .await
       .unwrap_err();
     assert!(error.to_string().contains("Slurm only"));
@@ -387,7 +420,7 @@ mod tests {
     assert!(jobs.iter().any(|job| job.id.contains('_')));
     assert!(
       source
-        .details(&jobs[0].id)
+        .details(&jobs[0].id, &mut Metadata::default())
         .await
         .unwrap()
         .contains("Overview")
@@ -419,7 +452,10 @@ mod tests {
     let mut source = Source::demo(Scheduler::Flux);
     let jobs = source.jobs().await.unwrap();
     assert_eq!(jobs[2].state, "SCHED");
-    let details = source.details(&jobs[0].id).await.unwrap();
+    let details = source
+      .details(&jobs[0].id, &mut Metadata::default())
+      .await
+      .unwrap();
     assert!(details.starts_with("Overview\n"));
     assert!(details.contains("Demo\n"));
     assert!(details.contains("Simulated"));
@@ -430,7 +466,12 @@ mod tests {
   async fn unknown_and_finished_jobs_cannot_be_canceled() {
     let mut source = Source::demo(Scheduler::Slurm);
     assert!(source.cancel("unknown").await.is_err());
-    assert!(source.details("unknown").await.is_err());
+    assert!(
+      source
+        .details("unknown", &mut Metadata::default())
+        .await
+        .is_err()
+    );
     let jobs = source.jobs().await.unwrap();
     assert!(source.cancel(&jobs[4].id).await.is_err());
   }
