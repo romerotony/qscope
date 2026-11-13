@@ -757,9 +757,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Length(12),
         Constraint::Percentage(25),
         Constraint::Length(12),
-        Constraint::Length(16),
+        Constraint::Length(20),
         Constraint::Length(elapsed_width.max(10)),
-        Constraint::Min(10),
+        Constraint::Min(6),
       ]
     },
   )
