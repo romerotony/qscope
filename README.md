@@ -83,7 +83,7 @@ filter appears in the top border of the Jobs box. Shortcuts are listed in the po
 | s | Cycle ascending ID/name/state sort |
 | Enter | Fetch selected job details and focus that pane |
 | Enter (details focused) | Close Details and return to Jobs |
-| Enter (stdout focused) | Toggle maximized stdout / 55-45 split layout |
+| Enter (stdout focused) | Toggle maximized stdout / 45-55 split layout |
 | Esc / q (stdout maximized) | Restore split layout, keeping stdout focused |
 | Page Up / Page Down | Scroll details |
 | Tab / Shift-Tab | Switch jobs / stdout; disabled while details is focused |

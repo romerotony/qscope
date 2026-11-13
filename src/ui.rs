@@ -626,17 +626,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
       .spacing(1)
       .split(status_inner);
   frame.render_widget(
-    Paragraph::new(format!(
-      " {} · Jobs: {}/{} · Sort: {}",
-      app.backend,
-      app.visible.len(),
-      app.jobs.len(),
-      if app.query.trim().is_empty() {
-        ["ID", "Name", "State"][app.sort]
-      } else {
-        "relevance"
-      }
-    )),
+    Paragraph::new(Line::from(vec![
+      Span::raw(" "),
+      Span::styled("qscope", Style::default().add_modifier(Modifier::BOLD)),
+      Span::raw(format!(
+        " · {} · Jobs: {}/{} · Sort: {}",
+        app.backend,
+        app.visible.len(),
+        app.jobs.len(),
+        if app.query.trim().is_empty() {
+          ["ID", "Name", "State"][app.sort]
+        } else {
+          "relevance"
+        }
+      )),
+    ])),
     status_columns[0],
   );
   frame.render_widget(
@@ -654,7 +658,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     return;
   }
   let columns =
-    Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(areas[0]);
+    Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).split(areas[0]);
   let lower_panel = if app.details.is_some() {
     Constraint::Percentage(60)
   } else {
@@ -955,7 +959,9 @@ fn draw_resources(frame: &mut Frame, app: &App, area: Rect) {
     }
   };
   let show = |value: &Option<String>| value.clone().unwrap_or_else(|| "—".into());
-  let parts = Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).split(inner);
+  let parts = Layout::vertical([Constraint::Length(6), Constraint::Min(0)])
+    .spacing(1)
+    .split(inner);
   let rows = [
     (
       "Nodes",
@@ -983,7 +989,7 @@ fn draw_resources(frame: &mut Frame, app: &App, area: Rect) {
       rows,
       [
         Constraint::Length(13),
-        Constraint::Percentage(45),
+        Constraint::Length(16),
         Constraint::Min(5),
       ],
     )
@@ -998,7 +1004,7 @@ fn draw_resources(frame: &mut Frame, app: &App, area: Rect) {
   );
   frame.render_widget(
     Paragraph::new(format!(
-      "Elapsed: {} · Limit: {}\nNodes: {}",
+      "Elapsed: {} · Limit: {}\n\nNodes: {}",
       crate::duration::elapsed(
         resources.elapsed.as_deref().unwrap_or("—"),
         app.selected().map_or("", |job| job.state.as_str()),
@@ -1207,7 +1213,7 @@ mod tests {
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     assert!(!app.output_maximized);
     assert!(app.output_focus);
-    assert_eq!(app.panes.output.width, 54);
+    assert_eq!(app.panes.output.width, 66);
     assert_eq!(app.selected().unwrap().id, "1");
     assert!(!app.output_follow);
     app.navigate(enter);
