@@ -25,9 +25,12 @@ pub struct Args {
   pub scheduler: Option<Scheduler>,
   #[arg(long)]
   pub config: Option<PathBuf>,
-  /// Polling interval in seconds (minimum 5)
+  /// Scheduler polling interval in seconds (default 5, minimum 1)
   #[arg(long)]
   pub refresh: Option<u64>,
+  /// Stdout polling interval in seconds (default 1, minimum 1)
+  #[arg(long)]
+  pub stdout_refresh: Option<u64>,
 }
 
 /// Missing settings inherit defaults; unknown keys are rejected to catch typos.
@@ -36,6 +39,7 @@ pub struct Args {
 pub struct Config {
   pub scheduler: Scheduler,
   pub refresh_interval_secs: u64,
+  pub stdout_refresh_interval_secs: u64,
   pub command_timeout_secs: u64,
 }
 
@@ -43,7 +47,8 @@ impl Default for Config {
   fn default() -> Self {
     Self {
       scheduler: Scheduler::Auto,
-      refresh_interval_secs: 10,
+      refresh_interval_secs: 5,
+      stdout_refresh_interval_secs: 1,
       command_timeout_secs: 15,
     }
   }
@@ -76,10 +81,17 @@ impl Config {
     if let Some(refresh) = args.refresh {
       config.refresh_interval_secs = refresh;
     }
-    // A lower bound protects the scheduler from overly aggressive polling.
+    if let Some(refresh) = args.stdout_refresh {
+      config.stdout_refresh_interval_secs = refresh;
+    }
+    // Reject zero to avoid an unbounded polling loop.
     ensure!(
-      config.refresh_interval_secs >= 5,
-      "Refresh interval must be at least 5 seconds"
+      config.stdout_refresh_interval_secs >= 1,
+      "Stdout refresh interval must be at least 1 second"
+    );
+    ensure!(
+      config.refresh_interval_secs >= 1,
+      "Refresh interval must be at least 1 second"
     );
     ensure!(
       config.command_timeout_secs > 0,
@@ -93,10 +105,38 @@ impl Config {
 mod tests {
   use super::*;
   #[test]
+  fn refresh_allows_one_second_but_rejects_zero() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), "scheduler = 'auto'\n").unwrap();
+    let mut args = Args {
+      demo: true,
+      scheduler: None,
+      config: Some(file.path().to_path_buf()),
+      refresh: None,
+      stdout_refresh: None,
+    };
+    let defaults = Config::load(&args).unwrap();
+    assert_eq!(defaults.refresh_interval_secs, 5);
+    assert_eq!(defaults.stdout_refresh_interval_secs, 1);
+    args.refresh = Some(0);
+    assert!(Config::load(&args).is_err());
+    args.refresh = Some(1);
+    assert_eq!(Config::load(&args).unwrap().refresh_interval_secs, 1);
+    args.refresh = Some(30);
+    assert_eq!(Config::load(&args).unwrap().refresh_interval_secs, 30);
+    args.stdout_refresh = Some(0);
+    assert!(Config::load(&args).is_err());
+    args.stdout_refresh = Some(2);
+    let config = Config::load(&args).unwrap();
+    assert_eq!(config.stdout_refresh_interval_secs, 2);
+    assert_eq!(config.refresh_interval_secs, 30);
+  }
+  #[test]
   fn config_defaults_and_validation() {
     let config: Config = toml::from_str("scheduler = 'flux'").unwrap();
     assert_eq!(config.scheduler, Scheduler::Flux);
-    assert_eq!(config.refresh_interval_secs, 10);
+    assert_eq!(config.refresh_interval_secs, 5);
+    assert_eq!(config.stdout_refresh_interval_secs, 1);
     assert!(toml::from_str::<Config>("scheduler = 'pbs'").is_err());
     assert!(toml::from_str::<Config>("typo = 1").is_err());
   }

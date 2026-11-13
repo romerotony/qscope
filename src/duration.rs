@@ -51,9 +51,30 @@ pub fn elapsed(text: &str, state: &str) -> String {
   seconds(text).map(clock).unwrap_or_else(|| text.into())
 }
 
+/// Interpolate running clocks locally between scheduler snapshots. Pending,
+/// suspended, and terminal states must not accumulate additional runtime.
+pub fn elapsed_since(text: &str, state: &str, additional_seconds: u64) -> String {
+  if matches!(state, "RUN" | "RUNNING")
+    && let Some(seconds) = seconds(text)
+  {
+    clock(seconds.saturating_add(additional_seconds))
+  } else {
+    elapsed(text, state)
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+  #[test]
+  fn local_elapsed_ticks_only_for_running_jobs() {
+    assert_eq!(elapsed_since("120s", "RUNNING", 10), "02:10");
+    assert_eq!(elapsed_since("00:02:00", "RUN", 10), "02:10");
+    assert_eq!(elapsed_since("120s", "COMPLETED", 10), "02:00");
+    assert_eq!(elapsed_since("120s", "SUSPENDED", 10), "02:00");
+    assert_eq!(elapsed_since("0:00", "PENDING", 10), "—");
+    assert_eq!(elapsed_since("—", "RUN", 10), "—");
+  }
   #[test]
   fn scheduler_times_become_clocks() {
     for (input, expected) in [

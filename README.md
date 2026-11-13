@@ -57,7 +57,8 @@ Use `--config PATH` to specify a different file. CLI flags override config.
 
 ```toml
 scheduler = "auto" # auto | slurm | flux
-refresh_interval_secs = 10 # minimum 5
+refresh_interval_secs = 5 # jobs/resources; minimum 1
+stdout_refresh_interval_secs = 1 # file reads; minimum 1
 command_timeout_secs = 15
 ```
 
@@ -158,8 +159,14 @@ many terminals allow native text selection by holding Shift.
 
 ### Slurm stdout panel
 
-The right-hand panel follows the selected job and refreshes its output every two
-seconds when the worker is available. It resolves `StdOut` and `WorkDir` from
+The right-hand panel follows the selected job and refreshes its output at the
+stdout interval (one second by default) when the worker is available. Set it with
+`--stdout-refresh SECONDS` or `stdout_refresh_interval_secs`. Scheduler jobs and
+resources refresh every five seconds by default (`--refresh SECONDS` or
+`refresh_interval_secs`). Running elapsed clocks advance locally each second
+between snapshots without querying the scheduler. `r` requests an immediate
+refresh of all three; slow reads remain serialized and may stretch the cadence.
+The viewer resolves `StdOut` and `WorkDir` from
 `scontrol show job` and caches the path for the current job. It does not assume
 the default filename. Paths with spaces, relative paths, and unresolved `%j`,
 `%A`, `%a`, and `%%` patterns are supported; other unresolved patterns show a

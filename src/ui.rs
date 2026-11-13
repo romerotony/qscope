@@ -40,6 +40,8 @@ pub struct App {
   last_output_click: Option<(u16, u16, Instant)>,
   /// Selected job's resource snapshot, or a diagnostic from its last query.
   pub resources: Option<(String, Result<crate::resources::Resources, String>)>,
+  jobs_updated: Instant,
+  pub resources_updated: Option<Instant>,
   /// Stdout follows selection. Pausing retains a stable snapshot and cursor;
   /// refreshed output is buffered until the user explicitly resumes following.
   pub output_id: Option<String>,
@@ -96,6 +98,8 @@ impl App {
       last_job_click: None,
       last_output_click: None,
       resources: None,
+      jobs_updated: Instant::now(),
+      resources_updated: None,
       output_id: None,
       output_path: String::new(),
       output_text: String::new(),
@@ -128,7 +132,16 @@ impl App {
   pub fn replace_jobs(&mut self, jobs: Vec<Job>) {
     let id = self.selected().map(|j| j.id.clone());
     self.jobs = jobs;
+    self.jobs_updated = Instant::now();
     self.rebuild(id);
+  }
+
+  fn job_elapsed(&self, job: &Job) -> String {
+    crate::duration::elapsed_since(
+      &job.runtime,
+      &job.state,
+      self.jobs_updated.elapsed().as_secs(),
+    )
   }
   /// Recompute visible indices; select the first match if no ID is preserved.
   pub fn rebuild(&mut self, preserve: Option<String>) {
@@ -690,11 +703,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
   let elapsed_width = app
     .visible
     .iter()
-    .map(|&i| {
-      crate::duration::elapsed(&app.jobs[i].runtime, &app.jobs[i].state)
-        .chars()
-        .count()
-    })
+    .map(|&i| app.job_elapsed(&app.jobs[i]).chars().count())
     .max()
     .unwrap_or(8)
     .max(8) as u16;
@@ -703,7 +712,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     .iter()
     .map(|&i| {
       let j = &app.jobs[i];
-      let elapsed = crate::duration::elapsed(&j.runtime, &j.state);
+      let elapsed = app.job_elapsed(j);
       let color = match j.state.as_str() {
         "RUNNING" | "RUN" => Color::Green,
         "PENDING" | "SCHED" | "DEPEND" | "PRIORITY" => Color::Yellow,
@@ -1005,9 +1014,10 @@ fn draw_resources(frame: &mut Frame, app: &App, area: Rect) {
   frame.render_widget(
     Paragraph::new(format!(
       "Elapsed: {} · Limit: {}\n\nNodes: {}",
-      crate::duration::elapsed(
+      crate::duration::elapsed_since(
         resources.elapsed.as_deref().unwrap_or("—"),
         app.selected().map_or("", |job| job.state.as_str()),
+        app.resources_updated.map_or(0, |at| at.elapsed().as_secs()),
       ),
       show(&resources.limit),
       show(&resources.hosts)
@@ -1099,6 +1109,20 @@ fn centered(area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
   use super::*;
+  #[test]
+  fn cached_jobs_tick_locally_and_new_snapshots_reset_the_clock() {
+    let mut app = App::new("Slurm");
+    app.replace_jobs(vec![job("1")]);
+    app.jobs_updated = Instant::now() - Duration::from_secs(10);
+    assert_eq!(app.job_elapsed(&app.jobs[0]), "00:20");
+    let mut finished = job("1");
+    finished.state = "COMPLETED".into();
+    app.replace_jobs(vec![finished]);
+    app.jobs_updated = Instant::now() - Duration::from_secs(10);
+    assert_eq!(app.job_elapsed(&app.jobs[0]), "00:10");
+    app.replace_jobs(vec![job("1")]);
+    assert_eq!(app.job_elapsed(&app.jobs[0]), "00:10");
+  }
   #[tokio::test]
   async fn stdout_can_page_before_tail_and_jump_to_start_of_large_file() {
     use crate::output::{self, Position};

@@ -146,6 +146,7 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
                 app.reset_output();
                 next_output = Instant::now();
                 app.resources = None;
+                app.resources_updated = None;
                 if app.details.as_ref().is_some_and(|(id, _)| Some(id) != selected_id.as_ref()) {
                     app.details = None;
                     app.details_focus = false;
@@ -182,8 +183,8 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
                 requests.send(Request::Output(id, output::Position::Tail, app.output_revision)).await?;
                 busy = true;
                 // File polling is independent of scheduler polling. The resolved
-                // path is cached so this does not query Slurm every two seconds.
-                next_output = Instant::now() + Duration::from_secs(2);
+                // path is cached so file refreshes do not query Slurm again.
+                next_output = Instant::now() + Duration::from_secs(config.stdout_refresh_interval_secs);
             }
             terminal.draw(|frame| ui::draw(frame, &mut app))?;
             tokio::select! {
@@ -213,9 +214,11 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
                             refresh_needed = true;
                         }
                         Response::Output(id, position, revision, result) => {
-                            // Failed metadata lookups should not hit the
-                            // controller at the faster file-polling cadence.
-                            let retry_secs = if result.is_err() { config.refresh_interval_secs } else { 2 };
+                            let retry_secs = if result.is_err() {
+                                config.refresh_interval_secs.max(config.stdout_refresh_interval_secs)
+                            } else {
+                                config.stdout_refresh_interval_secs
+                            };
                             // Ignore results for a selection the user has left.
                             if app.selected().is_some_and(|job| job.id == id) && revision == app.output_revision {
                                 match result {
@@ -236,6 +239,7 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
                         Response::Resources(id, result) => {
                             if app.selected().is_some_and(|job| job.id == id) {
                                 app.resources = Some((id, result.map(|resources| *resources).map_err(|error| format!("Resources unavailable: {error:#}"))));
+                                app.resources_updated = Some(Instant::now());
                                 next_resources = Instant::now() + Duration::from_secs(config.refresh_interval_secs);
                             }
                         }
