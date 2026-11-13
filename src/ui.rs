@@ -49,6 +49,11 @@ pub struct App {
   pub output_top: usize,
   pub output_follow: bool,
   output_pending: Option<String>,
+  output_page: Option<crate::output::Page>,
+  output_pending_page: Option<crate::output::Page>,
+  output_page_loading: bool,
+  pub output_request: Option<crate::output::Position>,
+  pub output_revision: u64,
   pub output_focus: bool,
   pub output_maximized: bool,
   /// Tracks the first `g` of Vim's `gg` shortcut while stdout is focused.
@@ -98,6 +103,11 @@ impl App {
       output_top: 0,
       output_follow: true,
       output_pending: None,
+      output_page: None,
+      output_pending_page: None,
+      output_page_loading: false,
+      output_request: None,
+      output_revision: 0,
       output_focus: false,
       output_maximized: false,
       output_g_pending: false,
@@ -182,6 +192,11 @@ impl App {
     self.output_top = 0;
     self.output_follow = true;
     self.output_pending = None;
+    self.output_page = None;
+    self.output_pending_page = None;
+    self.output_page_loading = false;
+    self.output_request = None;
+    self.output_revision = self.output_revision.wrapping_add(1);
     self.output_g_pending = false;
   }
 
@@ -190,7 +205,7 @@ impl App {
       self.output_text = text;
       self.output_cursor = self.output_text.lines().count().saturating_sub(1);
     } else {
-      // Keep at most one pending tail, bounded by the reader's 64 KiB limit.
+      // Keep at most one pending tail, bounded by the reader's page size.
       // Holding the displayed snapshot also survives file rotation/truncation.
       self.output_pending = Some(text);
     }
@@ -202,6 +217,13 @@ impl App {
       self.output_cursor = last;
     }
     self.output_follow = false;
+    if let Some(page) = self.output_page {
+      if delta < 0 && self.output_cursor == 0 && page.start > 0 {
+        self.request_output_page(crate::output::Position::Before(page));
+      } else if delta > 0 && self.output_cursor == last && page.end < page.length {
+        self.request_output_page(crate::output::Position::After(page));
+      }
+    }
     self.output_cursor = self.output_cursor.saturating_add_signed(delta).min(last);
   }
 
@@ -209,14 +231,65 @@ impl App {
     self.output_follow = false;
     self.output_cursor = 0;
     self.output_top = 0;
+    if self.output_page.is_some_and(|page| page.start > 0) {
+      self.output_page_loading = false;
+      self.request_output_page(crate::output::Position::Start);
+    }
   }
 
   fn follow_output(&mut self) {
     self.output_follow = true;
     if let Some(text) = self.output_pending.take() {
       self.output_text = text;
+      self.output_page = self.output_pending_page.take();
     }
     self.output_cursor = self.output_text.lines().count().saturating_sub(1);
+    // Invalidate an in-flight history page and fetch the current tail.
+    self.output_revision = self.output_revision.wrapping_add(1);
+    self.output_request = Some(crate::output::Position::Tail);
+    self.output_page_loading = false;
+  }
+
+  fn request_output_page(&mut self, position: crate::output::Position) {
+    if !self.output_page_loading {
+      self.output_revision = self.output_revision.wrapping_add(1);
+      self.output_request = Some(position);
+      self.output_page_loading = true;
+    }
+  }
+
+  pub fn apply_output_page(
+    &mut self,
+    position: crate::output::Position,
+    output: crate::output::Output,
+  ) {
+    self.output_path = output.path;
+    self.output_page_loading = false;
+    if position == crate::output::Position::Tail {
+      if self.output_follow {
+        self.output_page = output.page;
+      } else {
+        self.output_pending_page = output.page;
+      }
+      self.replace_output(output.text);
+    } else if !self.output_follow {
+      self.output_page = output.page;
+      self.output_text = output.text;
+      if matches!(position, crate::output::Position::Before(_)) {
+        self.output_cursor = self.output_text.lines().count().saturating_sub(1);
+        self.output_top = usize::MAX;
+      } else {
+        self.output_cursor = 0;
+        self.output_top = 0;
+      }
+    }
+  }
+
+  pub fn output_page_failed(&mut self) {
+    self.output_page_loading = false;
+    if self.output_follow {
+      self.output_page = None;
+    }
   }
 
   pub fn set_output_focus(&mut self, focused: bool) {
@@ -344,6 +417,16 @@ impl App {
         return;
       }
       self.output_follow = false;
+      if let Some(page) = self.output_page {
+        if delta < 0 && self.output_top == 0 && page.start > 0 {
+          self.request_output_page(crate::output::Position::Before(page));
+        } else if delta > 0
+          && self.output_top >= count.saturating_sub(height)
+          && page.end < page.length
+        {
+          self.request_output_page(crate::output::Position::After(page));
+        }
+      }
       let top = self
         .output_top
         .saturating_add_signed(delta)
@@ -637,8 +720,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
           (&j.state, Some(2)),
           (&j.queue, Some(3)),
           (&elapsed, None),
-          (&j.nodes, None),
-          (&j.cores, None),
           (&j.reason, Some(5)),
         ]
       };
@@ -672,10 +753,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Length(12),
         Constraint::Percentage(25),
         Constraint::Length(12),
-        Constraint::Length(12),
+        Constraint::Length(16),
         Constraint::Length(elapsed_width.max(10)),
-        Constraint::Length(5),
-        Constraint::Length(6),
         Constraint::Min(10),
       ]
     },
@@ -684,16 +763,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     Row::new(if compact {
       vec!["ID", "NAME", "STATE", "ELAPSED"]
     } else {
-      vec![
-        "ID",
-        "NAME",
-        "STATE",
-        "QUEUE",
-        "ELAPSED",
-        "NODES",
-        "CORES",
-        "REASON / NODES",
-      ]
+      vec!["ID", "NAME", "STATE", "QUEUE", "ELAPSED", "REASON / NODES"]
     })
     .style(Style::default().add_modifier(Modifier::BOLD)),
   )
@@ -790,7 +860,7 @@ Scrolling
   PgUp / PgDn       Scroll stdout or job details
   Ctrl-u / Ctrl-b   Scroll focused text pane back 10 lines
   Ctrl-d / Ctrl-f   Scroll focused text pane forward 10 lines
-  gg / Home         Top of retained stdout (stdout focused)
+  gg / Home         Beginning of stdout file (stdout focused)
   G / End           Follow latest stdout (stdout focused)
 
 General
@@ -928,14 +998,13 @@ fn draw_resources(frame: &mut Frame, app: &App, area: Rect) {
   );
   frame.render_widget(
     Paragraph::new(format!(
-      "Elapsed: {} · Limit: {}\nNodes: {}\n{}",
+      "Elapsed: {} · Limit: {}\nNodes: {}",
       crate::duration::elapsed(
         resources.elapsed.as_deref().unwrap_or("—"),
         app.selected().map_or("", |job| job.state.as_str()),
       ),
       show(&resources.limit),
-      show(&resources.hosts),
-      resources.note
+      show(&resources.hosts)
     ))
     .wrap(Wrap { trim: false }),
     parts[1],
@@ -1024,6 +1093,53 @@ fn centered(area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
   use super::*;
+  #[tokio::test]
+  async fn stdout_can_page_before_tail_and_jump_to_start_of_large_file() {
+    use crate::output::{self, Position};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("large.out");
+    let text: String = (0..20_000).map(|i| format!("line {i:06}\n")).collect();
+    std::fs::write(&path, text).unwrap();
+    let mut app = App::new("Slurm");
+    app.apply_output_page(Position::Tail, output::read(path.clone()).await.unwrap());
+    assert!(app.output_page.unwrap().start > 0);
+    app.output_follow = false;
+    app.output_cursor = 0;
+    let previous_start = app.output_page.unwrap().start;
+    app.move_output(-1);
+    let request = app.output_request.take().unwrap();
+    assert!(matches!(request, Position::Before(_)));
+    app.apply_output_page(
+      request,
+      output::read_page(path.clone(), request).await.unwrap(),
+    );
+    assert!(app.output_page.unwrap().start < previous_start);
+    app.output_start();
+    let request = app.output_request.take().unwrap();
+    assert_eq!(request, Position::Start);
+    app.apply_output_page(
+      request,
+      output::read_page(path.clone(), request).await.unwrap(),
+    );
+    assert!(app.output_text.starts_with("line 000000\n"));
+    app.output_cursor = app.output_text.lines().count() - 1;
+    app.move_output(1);
+    let request = app.output_request.take().unwrap();
+    assert!(matches!(request, Position::After(_)));
+    let end = app.output_page.unwrap().end;
+    app.apply_output_page(
+      request,
+      output::read_page(path.clone(), request).await.unwrap(),
+    );
+    assert_eq!(app.output_page.unwrap().start, end);
+    let frozen = app.output_text.clone();
+    app.apply_output_page(Position::Tail, output::read(path.clone()).await.unwrap());
+    assert_eq!(app.output_text, frozen);
+    app.follow_output();
+    assert!(app.output_text.contains("line 019999"));
+    assert!(app.output_follow);
+    assert_eq!(app.output_request, Some(Position::Tail));
+  }
   #[test]
   fn double_click_stdout_toggles_maximize_without_changing_pause() {
     let backend = ratatui::backend::TestBackend::new(120, 30);

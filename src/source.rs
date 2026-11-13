@@ -65,7 +65,12 @@ impl Source {
 
   /// Read local stdout only for Slurm. Flux output can live in its KVS and
   /// needs a separate implementation; do not guess a Slurm filename for it.
-  pub async fn output(&mut self, id: &str, reader: &mut Reader) -> Result<Output> {
+  pub async fn output(
+    &mut self,
+    id: &str,
+    reader: &mut Reader,
+    position: output::Position,
+  ) -> Result<Output> {
     match self {
       Self::Live(backend) if backend.kind == Scheduler::Slurm => {
         let path = match reader.path(id) {
@@ -76,7 +81,11 @@ impl Source {
             path
           }
         };
-        output::read(path).await
+        if position == output::Position::Tail {
+          output::read(path).await
+        } else {
+          output::read_page(path, position).await
+        }
       }
       Self::Live(_) => bail!("Stdout preview currently supports Slurm only"),
       Self::Demo(demo) => {
@@ -105,6 +114,7 @@ impl Source {
         Ok(Output {
           path: format!("DEMO /demo/logs/{}.out", job.id),
           text,
+          page: None,
         })
       }
     }
@@ -330,18 +340,26 @@ mod tests {
       let mut source = Source::demo(kind);
       let jobs = source.jobs().await.unwrap();
       let mut reader = Reader::default();
-      let output = source.output(&jobs[0].id, &mut reader).await.unwrap();
+      let output = source
+        .output(&jobs[0].id, &mut reader, output::Position::Tail)
+        .await
+        .unwrap();
       assert!(output.path.starts_with("DEMO"));
       assert!(output.text.contains("step 001"));
       assert!(
         source
-          .output(&jobs[2].id, &mut reader)
+          .output(&jobs[2].id, &mut reader, output::Position::Tail)
           .await
           .unwrap()
           .text
           .contains("Waiting to start")
       );
-      assert!(source.output("unknown", &mut reader).await.is_err());
+      assert!(
+        source
+          .output("unknown", &mut reader, output::Position::Tail)
+          .await
+          .is_err()
+      );
     }
   }
 
@@ -352,7 +370,7 @@ mod tests {
       timeout: std::time::Duration::from_millis(1),
     });
     let error = source
-      .output("1", &mut Reader::default())
+      .output("1", &mut Reader::default(), output::Position::Tail)
       .await
       .unwrap_err();
     assert!(error.to_string().contains("Slurm only"));

@@ -31,7 +31,7 @@ enum Request {
   Jobs,
   Details(String),
   Cancel(String),
-  Output(String),
+  Output(String, output::Position, u64),
   Resources(String),
 }
 /// Results include the requested job ID so details remain tied to the right job
@@ -40,7 +40,7 @@ enum Response {
   Jobs(Result<Vec<Job>>),
   Details(String, Result<String>),
   Cancel(String, Result<()>),
-  Output(String, Result<output::Output>),
+  Output(String, output::Position, u64, Result<output::Output>),
   Resources(String, Result<Box<resources::Resources>>),
 }
 
@@ -110,9 +110,9 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
           let result = backend.cancel(&id).await;
           Response::Cancel(id, result)
         }
-        Request::Output(id) => {
-          let result = backend.output(&id, &mut output_reader).await;
-          Response::Output(id, result)
+        Request::Output(id, position, revision) => {
+          let result = backend.output(&id, &mut output_reader, position).await;
+          Response::Output(id, position, revision, result)
         }
         Request::Resources(id) => {
           let result = backend.resources(&id).await.map(Box::new);
@@ -159,6 +159,12 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
                 requests.send(Request::Details(id)).await?;
                 busy = true;
             }
+            if !busy && app.confirm.is_none()
+                && let Some(id) = selected_id.clone()
+                && let Some(position) = app.output_request.take() {
+                requests.send(Request::Output(id, position, app.output_revision)).await?;
+                busy = true;
+            }
             // Pause refreshes during confirmation and capture the target ID
             // separately, so a changing job list cannot change what gets canceled.
             if !busy && app.confirm.is_none() && (refresh_needed || Instant::now() >= next_refresh) {
@@ -173,7 +179,7 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
             }
             if !busy && app.confirm.is_none() && Instant::now() >= next_output
                 && let Some(id) = selected_id {
-                requests.send(Request::Output(id)).await?;
+                requests.send(Request::Output(id, output::Position::Tail, app.output_revision)).await?;
                 busy = true;
                 // File polling is independent of scheduler polling. The resolved
                 // path is cached so this does not query Slurm every two seconds.
@@ -206,15 +212,23 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
                             app.status = match result { Ok(()) => format!("Cancellation requested for {id}"), Err(e) => format!("Cancellation failed: {e:#}") };
                             refresh_needed = true;
                         }
-                        Response::Output(id, result) => {
+                        Response::Output(id, position, revision, result) => {
                             // Failed metadata lookups should not hit the
                             // controller at the faster file-polling cadence.
                             let retry_secs = if result.is_err() { config.refresh_interval_secs } else { 2 };
                             // Ignore results for a selection the user has left.
-                            if app.selected().is_some_and(|job| job.id == id) {
+                            if app.selected().is_some_and(|job| job.id == id) && revision == app.output_revision {
                                 match result {
-                                    Ok(output) => { app.output_path = output.path; app.replace_output(output.text); }
-                                    Err(error) => { app.output_path.clear(); app.replace_output(format!("Stdout unavailable: {error:#}")); }
+                                    Ok(output) => app.apply_output_page(position, output),
+                                    Err(error) => {
+                                        app.output_page_failed();
+                                        if app.output_follow {
+                                            app.output_path.clear();
+                                            app.replace_output(format!("Stdout unavailable: {error:#}"));
+                                        } else {
+                                            app.status = format!("Output read failed: {error:#}");
+                                        }
+                                    }
                                 }
                             }
                             next_output = Instant::now() + Duration::from_secs(retry_secs);

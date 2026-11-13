@@ -89,7 +89,7 @@ filter appears in the top border of the Jobs box. Shortcuts are listed in the po
 | Tab / Shift-Tab | Switch jobs / stdout; disabled while details is focused |
 | Ctrl-u / Ctrl-d (text pane focused) | Scroll back / forward by 10 lines |
 | Ctrl-b / Ctrl-f (text pane focused) | Same as Ctrl-u / Ctrl-d |
-| gg / Home (stdout focused) | Jump to top of retained output |
+| gg / Home (stdout focused) | Jump to beginning of the stdout file |
 | G / End (stdout focused) | Resume following newest output |
 | Page Up / Page Down (stdout focused) | Scroll back / toward newest output |
 | End (stdout focused) | Resume following newest output |
@@ -174,7 +174,13 @@ buffered without shifting the view, even if the file rotates. `G` or
 End loads the latest buffered output and resumes following.
 Leaving the stdout pane automatically loads buffered output and resumes following.
 
-Only the last 64 KiB is read, with partial first lines discarded when possible.
+Following reads the last 64 KiB. Navigating past a page boundary loads an earlier
+or later 64 KiB page on demand, so the entire file is accessible without loading
+it all into memory. `gg`/Home loads the beginning directly; `G`/End returns to the
+latest tail. Pages align to line boundaries where possible; exceptionally long
+lines may span pages. The current page and a single pending tail are retained.
+If a file is replaced or truncated during history browsing, a diagnostic asks
+you to resume following rather than mixing unrelated file contents.
 The view follows the newest lines until you navigate within stdout. Long lines are clipped
 to panel width. Invalid UTF-8 is replaced and control characters are stripped.
 File operations have a UI timeout, though a stalled network-filesystem operation
