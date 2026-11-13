@@ -19,11 +19,12 @@ pub struct Page {
   pub length: u64,
   device: u64,
   inode: u64,
+  modified: (i64, i64),
+  changed: (i64, i64),
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Position {
-  #[default]
   Tail,
   Start,
   Before(Page),
@@ -44,6 +45,8 @@ pub struct Reader {
   failures: u32,
   retry_at: Option<Instant>,
   last_path: Option<PathBuf>,
+  // Only one tail is retained, bounded by MAX_BYTES. Explicit pages never reuse it.
+  tail: Option<(PathBuf, String, Page)>,
 }
 
 impl Default for Reader {
@@ -55,6 +58,7 @@ impl Default for Reader {
       failures: 0,
       retry_at: None,
       last_path: None,
+      tail: None,
     }
   }
 }
@@ -78,16 +82,31 @@ impl Reader {
 
   pub fn invalidate(&mut self, id: &str) {
     self.cached.retain(|(job, _, _)| job != id);
+    self.tail = None;
   }
 
   pub fn clear_paths(&mut self) {
     self.cached.clear();
+    self.tail = None;
     // Never discard the outstanding filesystem task, even on manual refresh.
   }
 
   pub async fn read(&mut self, path: PathBuf, position: Position) -> Result<Output> {
     let source = path.clone();
-    self.read_task(path, move || page(&source, position)).await
+    let previous = self
+      .tail
+      .as_ref()
+      .filter(|(cached, _, _)| cached == &path && position == Position::Tail)
+      .map(|(_, text, page)| (text.clone(), *page));
+    let result = self
+      .read_task(path.clone(), move || page(&source, position, previous))
+      .await;
+    if position == Position::Tail
+      && let Ok(output) = &result
+    {
+      self.tail = Some((path, output.text.clone(), output.page.unwrap()));
+    }
+    result
   }
 
   async fn read_task<F>(&mut self, path: PathBuf, task: F) -> Result<Output>
@@ -154,12 +173,26 @@ pub async fn read_page(path: PathBuf, position: Position) -> Result<Output> {
   Reader::default().read(path, position).await
 }
 
-fn page(path: &Path, position: Position) -> Result<(String, Page)> {
+fn page(
+  path: &Path,
+  position: Position,
+  previous: Option<(String, Page)>,
+) -> Result<(String, Page)> {
   use std::os::unix::fs::MetadataExt;
-  ensure!(
-    std::fs::metadata(path)?.is_file(),
-    "Output path is not a regular file"
-  );
+  let stat = std::fs::metadata(path)?;
+  ensure!(stat.is_file(), "Output path is not a regular file");
+  if position == Position::Tail
+    && let Some((text, previous)) = previous
+    && previous.device == stat.dev()
+    && previous.inode == stat.ino()
+    && previous.length == stat.len()
+    && previous.modified == (stat.mtime(), stat.mtime_nsec())
+    && previous.changed == (stat.ctime(), stat.ctime_nsec())
+  {
+    // Metadata checks still run in the single tracked filesystem task. No open,
+    // seek, or content read is necessary for an unchanged file.
+    return Ok((text, previous));
+  }
   let mut file = File::open(path)?;
   let metadata = file.metadata()?;
   let length = metadata.len();
@@ -211,6 +244,8 @@ fn page(path: &Path, position: Position) -> Result<(String, Page)> {
     length,
     device: metadata.dev(),
     inode: metadata.ino(),
+    modified: (metadata.mtime(), metadata.mtime_nsec()),
+    changed: (metadata.ctime(), metadata.ctime_nsec()),
   };
   Ok((
     if text.is_empty() {
@@ -274,6 +309,95 @@ pub fn slurm_path(details: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[tokio::test]
+  async fn unchanged_tail_reuses_content_but_changes_and_paging_read_again() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("job.out");
+    std::fs::write(&path, "first\n").unwrap();
+    let mut reader = Reader::default();
+    reader.read(path.clone(), Position::Tail).await.unwrap();
+    // A marker proves the unchanged branch reused cached content.
+    reader.tail.as_mut().unwrap().1 = "cached marker".into();
+    assert_eq!(
+      reader
+        .read(path.clone(), Position::Tail)
+        .await
+        .unwrap()
+        .text,
+      "cached marker"
+    );
+    assert_eq!(
+      reader
+        .read(path.clone(), Position::Start)
+        .await
+        .unwrap()
+        .text,
+      "first\n"
+    );
+    std::fs::write(&path, "longer output\n").unwrap();
+    assert_eq!(
+      reader
+        .read(path.clone(), Position::Tail)
+        .await
+        .unwrap()
+        .text,
+      "longer output\n"
+    );
+    std::fs::write(&path, "x\n").unwrap();
+    assert_eq!(
+      reader
+        .read(path.clone(), Position::Tail)
+        .await
+        .unwrap()
+        .text,
+      "x\n"
+    );
+    // Same size is insufficient for reuse: timestamp changes must invalidate.
+    reader.tail.as_mut().unwrap().1 = "stale".into();
+    reader.tail.as_mut().unwrap().2.modified.0 -= 1;
+    assert_eq!(
+      reader
+        .read(path.clone(), Position::Tail)
+        .await
+        .unwrap()
+        .text,
+      "x\n"
+    );
+    reader.tail.as_mut().unwrap().1 = "stale".into();
+    reader.tail.as_mut().unwrap().2.changed.0 -= 1;
+    assert_eq!(
+      reader
+        .read(path.clone(), Position::Tail)
+        .await
+        .unwrap()
+        .text,
+      "x\n"
+    );
+    let replacement = directory.path().join("replacement");
+    std::fs::write(&replacement, "y\n").unwrap();
+    std::fs::rename(&replacement, &path).unwrap();
+    assert_eq!(
+      reader
+        .read(path.clone(), Position::Tail)
+        .await
+        .unwrap()
+        .text,
+      "y\n"
+    );
+    reader.tail.as_mut().unwrap().1 = "stale".into();
+    reader.clear_paths();
+    assert_eq!(
+      reader
+        .read(path.clone(), Position::Tail)
+        .await
+        .unwrap()
+        .text,
+      "y\n"
+    );
+    std::fs::remove_file(&path).unwrap();
+    assert!(reader.read(path, Position::Tail).await.is_err());
+  }
 
   #[tokio::test]
   async fn timed_out_reads_remain_tracked_and_never_overlap() {

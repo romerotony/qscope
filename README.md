@@ -234,6 +234,18 @@ through job details.
 - Rendering formats only visible job rows, caches their formatted cells and clock
   widths, and updates running clocks once per second. Idle polling ticks no longer
   force five redraws per second. Input/resize/results still redraw promptly.
+- Snapshot filtering, sorting, and width scans run on one background rebuild task.
+  Search edits are debounced for 150 ms; only the latest pending request is kept,
+  and superseded results are discarded. The previous complete view remains usable
+  until its replacement is ready. Completed work is applied on the next UI event/tick.
+- Unchanged stdout tails reuse a single bounded content cache after checking file
+  identity, size, modification time, and change time. This avoids repeated opens
+  and content reads, but still performs a metadata check. Non-tail paging and `r`
+  bypass content reuse. Finished jobs poll stdout no faster than every 30 seconds
+  (slower configured intervals are preserved); state changes trigger a fresh poll.
+- Tokio uses two async worker threads and at most two blocking threads, independent
+  of the login node's CPU count. Filesystem work and view rebuilding remain bounded
+  to one outstanding task each.
 
 Tests cover stalled-read tracking, bounded shutdown, cache expiry/invalidation,
 mock Slurm/Flux command counts, selection debounce, and a 100,000-job rendering
@@ -247,6 +259,8 @@ for large installations.
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+# Optional synthetic 100,000-job rebuild/search latency measurement:
+cargo test --release large_snapshot_latency -- --ignored --nocapture
 ```
 
 Parser and UI tests do not require installed schedulers. Live integration

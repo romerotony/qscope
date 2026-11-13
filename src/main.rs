@@ -12,7 +12,7 @@ mod search;
 mod source;
 mod ui;
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use config::{Args, Config};
 use crossterm::event::{
@@ -75,6 +75,25 @@ impl SelectionGate {
   }
 }
 
+fn stdout_interval(state: &str, seconds: u64) -> Duration {
+  let terminal = matches!(
+    state,
+    "INACTIVE"
+      | "COMPLETED"
+      | "CANCELLED"
+      | "CANCELED"
+      | "FAILED"
+      | "TIMEOUT"
+      | "NODE_FAIL"
+      | "OUT_OF_MEMORY"
+      | "PREEMPTED"
+      | "BOOT_FAIL"
+      | "DEADLINE"
+      | "REVOKED"
+  );
+  Duration::from_secs(if terminal { seconds.max(30) } else { seconds })
+}
+
 /// Restore terminal settings when leaving the UI, including on returned errors.
 struct TerminalGuard;
 impl Drop for TerminalGuard {
@@ -87,6 +106,7 @@ impl Drop for TerminalGuard {
 fn main() -> Result<()> {
   let runtime = tokio::runtime::Builder::new_multi_thread()
     .enable_all()
+    .worker_threads(2)
     .max_blocking_threads(2)
     .build()?;
   let result = runtime.block_on(async_main());
@@ -199,6 +219,7 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
   let mut tick = tokio::time::interval(Duration::from_millis(200));
   tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
   let mut app = ui::App::new(name);
+  let mut rebuilder = ui::Rebuilder::default();
   let mut next_refresh = Instant::now();
   let mut next_output = Instant::now();
   let mut next_resources = Instant::now();
@@ -211,6 +232,17 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
   let mut last_clock_second = 0;
   let result: Result<()> = async {
         loop {
+            let previous = app.selected().map(|job| (job.id.clone(), job.state.clone(), job.nodes.clone(), job.cores.clone()));
+            if rebuilder.poll(&mut app).await {
+                dirty = true;
+                let current = app.selected().map(|job| (job.id.clone(), job.state.clone(), job.nodes.clone(), job.cores.clone()));
+                if current != previous {
+                    app.resources = None;
+                    app.resources_updated = None;
+                    next_resources = Instant::now();
+                    next_output = Instant::now();
+                }
+            }
             let selected_id = app.selected().map(|job| job.id.clone());
             if selected_id != app.output_id {
                 app.output_id = selected_id.clone();
@@ -258,9 +290,6 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
                 && let Some(id) = selected_id {
                 requests.send((generation, Request::Output(id, output::Position::Tail, app.output_revision))).await?;
                 busy = true;
-                // File polling is independent of scheduler polling. The resolved
-                // path is cached so file refreshes do not query Slurm again.
-                next_output = Instant::now() + Duration::from_secs(config.stdout_refresh_interval_secs);
             }
             let second = clock_started.elapsed().as_secs();
             if second != last_clock_second {
@@ -286,14 +315,7 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
                             next_refresh = Instant::now() + Duration::from_secs(config.refresh_interval_secs);
                             match result {
                                 Ok(jobs) => {
-                                    let previous = app.selected().map(|job| (job.id.clone(), job.state.clone(), job.nodes.clone(), job.cores.clone()));
-                                    app.replace_jobs(jobs);
-                                    let current = app.selected().map(|job| (job.id.clone(), job.state.clone(), job.nodes.clone(), job.cores.clone()));
-                                    if current != previous {
-                                        app.resources = None;
-                                        app.resources_updated = None;
-                                        next_resources = Instant::now();
-                                    }
+                                    rebuilder.request(&app, Some(jobs), false);
                                     app.status = "Connected".into();
                                 }
                                 Err(error) => app.status = format!("Refresh failed; showing last snapshot: {error:#}"),
@@ -331,7 +353,8 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
                                     }
                                 }
                             }
-                            next_output = Instant::now() + Duration::from_secs(retry_secs);
+                            next_output = Instant::now() + stdout_interval(
+                                app.selected().map_or("", |job| job.state.as_str()), retry_secs);
                         }
                         Response::Resources(id, result) => {
                             if app.selected().is_some_and(|job| job.id == id) {
@@ -376,9 +399,12 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
                     }
                     if app.searching {
                         match key.code {
-                            KeyCode::Esc | KeyCode::Enter => app.searching = false,
-                            KeyCode::Backspace => { app.query.pop(); app.rebuild(None); },
-                            KeyCode::Char(c) => { app.query.push(c); app.rebuild(None); },
+                            KeyCode::Esc | KeyCode::Enter => {
+                                app.searching = false;
+                                rebuilder.request(&app, None, false);
+                            },
+                            KeyCode::Backspace => { app.query.pop(); rebuilder.request(&app, None, true); },
+                            KeyCode::Char(c) => { app.query.push(c); rebuilder.request(&app, None, true); },
                             _ => {},
                         }
                         continue;
@@ -387,13 +413,12 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
                     if app.navigate(key) { continue; }
                     match key.code {
                         KeyCode::Char('q') => break,
-                        KeyCode::Esc => { app.details = None; app.query.clear(); app.rebuild(None); },
+                        KeyCode::Esc => { app.details = None; app.query.clear(); rebuilder.request(&app, None, false); },
                         KeyCode::Char('/') => app.searching = true,
-                        KeyCode::PageDown => app.detail_scroll = app.detail_scroll.saturating_add(10),
-                        KeyCode::PageUp => app.detail_scroll = app.detail_scroll.saturating_sub(10),
-                        KeyCode::Char('s') => { app.sort = (app.sort + 1) % 3; app.rebuild(None); },
+                        KeyCode::Char('s') => { app.sort = (app.sort + 1) % 3; rebuilder.request(&app, None, false); },
                         KeyCode::Char('r') => {
                             generation = generation.wrapping_add(1);
+                            rebuilder.invalidate();
                             refresh_needed = true;
                             next_output = Instant::now();
                             next_resources = Instant::now();
@@ -420,11 +445,28 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
   result
 }
 
-use anyhow::Context;
-
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn terminal_stdout_polling_is_slower_without_overriding_slower_configuration() {
+    for state in ["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "INACTIVE"] {
+      assert_eq!(stdout_interval(state, 1), Duration::from_secs(30));
+      assert_eq!(stdout_interval(state, 60), Duration::from_secs(60));
+    }
+    for state in [
+      "RUNNING",
+      "RUN",
+      "PENDING",
+      "SCHED",
+      "COMPLETING",
+      "CLEANUP",
+      "UNKNOWN",
+    ] {
+      assert_eq!(stdout_interval(state, 1), Duration::from_secs(1));
+    }
+  }
 
   #[test]
   fn selection_requests_debounce_and_rate_limit_without_sleeping() {

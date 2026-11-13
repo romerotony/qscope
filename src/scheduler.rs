@@ -23,7 +23,7 @@ pub struct Job {
 }
 
 /// A concrete scheduler selected at startup; `kind` must not be `Auto`.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Backend {
   pub kind: Scheduler,
   pub timeout: Duration,

@@ -11,26 +11,28 @@ use ratatui::{
   text::{Line, Span, Text},
   widgets::{Block, BorderType, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::{
+  collections::HashMap,
+  sync::Arc,
+  time::{Duration, Instant},
+};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Mutable UI state, owned by the event loop rather than the scheduler worker.
 pub struct App {
   /// Hit targets are recorded during rendering so wheel routing follows resize.
   panes: PaneAreas,
-  pub backend: &'static str,
-  pub jobs: Vec<Job>,
+  backend: &'static str,
+  jobs: Arc<Vec<Job>>,
   /// Indices into `jobs` in current filtered/sorted display order.
-  pub visible: Vec<usize>,
-  search: Search,
+  visible: Vec<usize>,
   matches: Vec<Option<JobMatch>>,
   row_cache: HashMap<usize, CachedRow>,
   max_running_seconds: Option<u64>,
   static_elapsed_width: usize,
   #[cfg(test)]
   row_builds: usize,
-  pub table: TableState,
+  table: TableState,
   pub query: String,
   pub searching: bool,
   /// Cycles through ID (0), name (1), and native state (2).
@@ -52,9 +54,9 @@ pub struct App {
   /// refreshed output is buffered until the user explicitly resumes following.
   pub output_id: Option<String>,
   pub output_path: String,
-  pub output_text: String,
-  pub output_cursor: usize,
-  pub output_top: usize,
+  output_text: String,
+  output_cursor: usize,
+  output_top: usize,
   pub output_follow: bool,
   output_pending: Option<String>,
   output_page: Option<crate::output::Page>,
@@ -62,13 +64,13 @@ pub struct App {
   output_page_loading: bool,
   pub output_request: Option<crate::output::Position>,
   pub output_revision: u64,
-  pub output_focus: bool,
-  pub output_maximized: bool,
+  output_focus: bool,
+  output_maximized: bool,
   /// Tracks the first `g` of Vim's `gg` shortcut while stdout is focused.
   output_g_pending: bool,
   /// The captured cancellation target, not a row number that could change.
   pub confirm: Option<String>,
-  pub help_open: bool,
+  help_open: bool,
   help_scroll: u16,
 }
 
@@ -90,14 +92,179 @@ struct CachedRow {
   row: Row<'static>,
 }
 
+/// Only snapshot-derived data crosses the background rebuild boundary.
+struct JobView {
+  jobs: Arc<Vec<Job>>,
+  sampled: Instant,
+  visible: Vec<usize>,
+  matches: Vec<Option<JobMatch>>,
+  max_running_seconds: Option<u64>,
+  static_elapsed_width: usize,
+}
+
+impl JobView {
+  fn build(jobs: Arc<Vec<Job>>, sampled: Instant, query: &str, sort: usize) -> Self {
+    let matches = Search::default().rank(&jobs, query);
+    let mut visible: Vec<_> = (0..jobs.len()).filter(|&i| matches[i].is_some()).collect();
+    let has_query = !query.trim().is_empty();
+    visible.sort_by(|&a, &b| {
+      let relevance = matches[b]
+        .as_ref()
+        .unwrap()
+        .score
+        .cmp(&matches[a].as_ref().unwrap().score);
+      if has_query && relevance != std::cmp::Ordering::Equal {
+        return relevance;
+      }
+      let a = &jobs[a];
+      let b = &jobs[b];
+      match sort {
+        1 => a.name.cmp(&b.name).then(a.id.cmp(&b.id)),
+        2 => state_order(&a.state)
+          .cmp(&state_order(&b.state))
+          .then(a.state.cmp(&b.state))
+          .then(a.id.cmp(&b.id)),
+        // Numeric IDs sort naturally; compound IDs retain their full text.
+        _ => match (a.id.parse::<u64>(), b.id.parse::<u64>()) {
+          (Ok(a), Ok(b)) => a.cmp(&b),
+          _ => a.id.cmp(&b.id),
+        },
+      }
+    });
+    let mut max_running_seconds = None;
+    let mut static_elapsed_width = 8;
+    let age = sampled.elapsed().as_secs();
+    for &index in &visible {
+      let job = &jobs[index];
+      if matches!(job.state.as_str(), "RUN" | "RUNNING")
+        && let Some(seconds) = crate::duration::seconds(&job.runtime)
+      {
+        max_running_seconds =
+          Some(max_running_seconds.map_or(seconds, |old: u64| old.max(seconds)));
+      } else {
+        static_elapsed_width = static_elapsed_width.max(
+          crate::duration::elapsed_since(&job.runtime, &job.state, age)
+            .chars()
+            .count(),
+        );
+      }
+    }
+    Self {
+      jobs,
+      sampled,
+      visible,
+      matches,
+      max_running_seconds,
+      static_elapsed_width,
+    }
+  }
+}
+
+struct RebuildRequest {
+  query: String,
+  sort: usize,
+  preserve_selection: bool,
+  ready_at: Instant,
+}
+
+/// One background rebuild at a time; keep only the newest pending input.
+/// The UI continues displaying the last complete, internally consistent view.
+pub struct Rebuilder {
+  jobs: Arc<Vec<Job>>,
+  sampled: Instant,
+  revision: u64,
+  pending: Option<RebuildRequest>,
+  task: Option<tokio::task::JoinHandle<(u64, bool, JobView)>>,
+  retired: Option<JobView>,
+}
+
+impl Default for Rebuilder {
+  fn default() -> Self {
+    Self {
+      jobs: Arc::new(Vec::new()),
+      sampled: Instant::now(),
+      revision: 0,
+      pending: None,
+      task: None,
+      retired: None,
+    }
+  }
+}
+
+impl Rebuilder {
+  pub fn invalidate(&mut self) {
+    self.revision = self.revision.wrapping_add(1);
+    self.pending = None;
+  }
+
+  pub fn request(&mut self, app: &App, jobs: Option<Vec<Job>>, debounce: bool) {
+    let preserve = jobs.is_some();
+    if let Some(jobs) = jobs {
+      self.jobs = Arc::new(jobs);
+      self.sampled = Instant::now();
+    }
+    self.revision = self.revision.wrapping_add(1);
+    self.pending = Some(RebuildRequest {
+      query: app.query.clone(),
+      sort: app.sort,
+      preserve_selection: preserve,
+      ready_at: Instant::now()
+        + if debounce {
+          Duration::from_millis(150)
+        } else {
+          Duration::ZERO
+        },
+    });
+  }
+
+  pub async fn poll(&mut self, app: &mut App) -> bool {
+    let mut changed = false;
+    if self.task.as_ref().is_some_and(|task| task.is_finished()) {
+      match self.task.take().unwrap().await {
+        Ok((revision, preserve, mut view)) if revision == self.revision => {
+          let id = preserve
+            .then(|| app.selected().map(|job| job.id.clone()))
+            .flatten();
+          app.apply_view(&mut view, id);
+          // Retire large buffers off the input task as well.
+          self.retired = Some(view);
+          changed = true;
+        }
+        Err(error) => {
+          app.status = format!("Job view rebuild failed: {error}");
+          changed = true;
+        }
+        Ok((_, _, view)) => self.retired = Some(view),
+      }
+    }
+    if self.task.is_none()
+      && self
+        .pending
+        .as_ref()
+        .is_some_and(|request| Instant::now() >= request.ready_at)
+    {
+      let request = self.pending.take().unwrap();
+      let jobs = self.jobs.clone();
+      let sampled = self.sampled;
+      let revision = self.revision;
+      let retired = self.retired.take();
+      self.task = Some(tokio::task::spawn_blocking(move || {
+        drop(retired);
+        let view = JobView::build(jobs, sampled, &request.query, request.sort);
+        (revision, request.preserve_selection, view)
+      }));
+    }
+    changed
+  }
+}
+
 impl App {
   pub fn new(backend: &'static str) -> Self {
     Self {
       panes: PaneAreas::default(),
       backend,
-      jobs: vec![],
+      jobs: Arc::new(vec![]),
       visible: vec![],
-      search: Search::default(),
       matches: vec![],
       row_cache: HashMap::new(),
       max_running_seconds: None,
@@ -147,9 +314,10 @@ impl App {
       .map(|&i| &self.jobs[i])
   }
   /// Preserve selection by identity when a refresh inserts or removes rows.
-  pub fn replace_jobs(&mut self, jobs: Vec<Job>) {
+  #[cfg(test)]
+  fn replace_jobs(&mut self, jobs: Vec<Job>) {
     let id = self.selected().map(|j| j.id.clone());
-    self.jobs = jobs;
+    self.jobs = Arc::new(jobs);
     self.jobs_updated = Instant::now();
     self.rebuild(id);
   }
@@ -244,68 +412,32 @@ impl App {
     }
     row
   }
-  /// Recompute visible indices; select the first match if no ID is preserved.
-  pub fn rebuild(&mut self, preserve: Option<String>) {
-    self.matches = self.search.rank(&self.jobs, &self.query);
-    self.visible = (0..self.jobs.len())
-      .filter(|&i| self.matches[i].is_some())
-      .collect();
-    self.visible.sort_by(|&a, &b| {
-      let relevance = self.matches[b]
-        .as_ref()
-        .unwrap()
-        .score
-        .cmp(&self.matches[a].as_ref().unwrap().score);
-      if !self.query.trim().is_empty() && relevance != std::cmp::Ordering::Equal {
-        return relevance;
-      }
-      let a = &self.jobs[a];
-      let b = &self.jobs[b];
-      match self.sort {
-        1 => a.name.cmp(&b.name).then(a.id.cmp(&b.id)),
-        2 => state_order(&a.state)
-          .cmp(&state_order(&b.state))
-          .then(a.state.cmp(&b.state))
-          .then(a.id.cmp(&b.id)),
-        // Numeric IDs sort naturally (3 before 20); array and other
-        // compound IDs fall back to string ordering without parsing loss.
-        _ => match (a.id.parse::<u64>(), b.id.parse::<u64>()) {
-          (Ok(a), Ok(b)) => a.cmp(&b),
-          _ => a.id.cmp(&b.id),
-        },
-      }
-    });
-    // Compute width statistics once per snapshot/filter/sort, not per redraw.
+  #[cfg(test)]
+  fn rebuild(&mut self, preserve: Option<String>) {
+    let mut view = JobView::build(self.jobs.clone(), self.jobs_updated, &self.query, self.sort);
+    self.apply_view(&mut view, preserve);
+  }
+
+  fn apply_view(&mut self, view: &mut JobView, preserve: Option<String>) {
+    std::mem::swap(&mut self.jobs, &mut view.jobs);
+    std::mem::swap(&mut self.jobs_updated, &mut view.sampled);
+    std::mem::swap(&mut self.visible, &mut view.visible);
+    std::mem::swap(&mut self.matches, &mut view.matches);
+    std::mem::swap(&mut self.max_running_seconds, &mut view.max_running_seconds);
+    std::mem::swap(
+      &mut self.static_elapsed_width,
+      &mut view.static_elapsed_width,
+    );
     self.row_cache.clear();
-    self.max_running_seconds = None;
-    self.static_elapsed_width = 8;
-    for &index in &self.visible {
-      let job = &self.jobs[index];
-      if matches!(job.state.as_str(), "RUN" | "RUNNING")
-        && let Some(seconds) = crate::duration::seconds(&job.runtime)
-      {
-        self.max_running_seconds = Some(
-          self
-            .max_running_seconds
-            .map_or(seconds, |old| old.max(seconds)),
-        );
-      } else {
-        self.static_elapsed_width = self
-          .static_elapsed_width
-          .max(self.job_elapsed(job).chars().count());
-      }
-    }
     let selected = preserve
       .and_then(|id| self.visible.iter().position(|&i| self.jobs[i].id == id))
       .unwrap_or(0);
-    self.table.select(if self.visible.is_empty() {
-      None
-    } else {
-      Some(selected)
-    });
+    self
+      .table
+      .select((!self.visible.is_empty()).then_some(selected));
   }
   /// Clamp navigation at table boundaries, including an empty filtered list.
-  pub fn move_selection(&mut self, delta: isize) {
+  fn move_selection(&mut self, delta: isize) {
     if self.visible.is_empty() {
       return;
     }
@@ -426,7 +558,7 @@ impl App {
     }
   }
 
-  pub fn set_output_focus(&mut self, focused: bool) {
+  fn set_output_focus(&mut self, focused: bool) {
     if self.output_focus && !focused {
       self.follow_output();
       self.output_maximized = false;
@@ -1212,6 +1344,115 @@ fn centered(area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  async fn finish_rebuild(worker: &mut Rebuilder, app: &mut App) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+      loop {
+        worker.poll(app).await;
+        if worker.pending.is_none() && worker.task.is_none() {
+          break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+      }
+    })
+    .await
+    .unwrap();
+  }
+
+  #[tokio::test]
+  async fn background_rebuild_coalesces_edits_and_discards_superseded_results() {
+    let mut app = App::new("Slurm");
+    let mut worker = Rebuilder::default();
+    worker.request(&app, Some(vec![job("1"), job("2")]), false);
+    assert!(!worker.poll(&mut app).await);
+    assert!(worker.task.is_some());
+    assert!(app.jobs.is_empty()); // The old view stays intact until completion.
+    app.query = "2".into();
+    worker.request(&app, None, true);
+    app.query = "1".into();
+    worker.request(&app, None, true);
+    // Force the deadline without a wall-clock debounce wait.
+    worker.pending.as_mut().unwrap().ready_at = Instant::now();
+    finish_rebuild(&mut worker, &mut app).await;
+    assert_eq!(app.visible.len(), 1);
+    assert_eq!(app.selected().unwrap().id, "1");
+    assert!(worker.task.is_none());
+    app.query.clear();
+    worker.request(&app, None, false);
+    finish_rebuild(&mut worker, &mut app).await;
+    app.table.select(Some(1));
+    worker.request(&app, Some(vec![job("0"), job("1"), job("2")]), false);
+    finish_rebuild(&mut worker, &mut app).await;
+    assert_eq!(app.selected().unwrap().id, "2");
+    worker.request(&app, Some(vec![job("99")]), false);
+    worker.poll(&mut app).await;
+    worker.invalidate();
+    finish_rebuild(&mut worker, &mut app).await;
+    assert_eq!(app.selected().unwrap().id, "2");
+  }
+
+  #[tokio::test]
+  async fn search_edits_wait_for_debounce_without_starting_work() {
+    let mut app = App::new("Slurm");
+    let mut worker = Rebuilder::default();
+    for query in ["s", "si", "sim"] {
+      app.query = query.into();
+      worker.request(&app, None, true);
+      assert!(!worker.poll(&mut app).await);
+      assert!(worker.task.is_none());
+    }
+    assert_eq!(worker.pending.as_ref().unwrap().query, "sim");
+  }
+
+  #[tokio::test]
+  #[ignore = "manual large-snapshot latency measurement; run with --release --ignored --nocapture"]
+  async fn large_snapshot_latency() {
+    let mut app = App::new("Slurm");
+    let jobs = (0..100_000)
+      .map(|id| {
+        let mut job = job(&id.to_string());
+        job.name = format!("simulation-array-{id}");
+        job
+      })
+      .collect();
+    let started = Instant::now();
+    app.replace_jobs(jobs);
+    eprintln!("100k snapshot rebuild: {:?}", started.elapsed());
+    for query in ["sim", "simulation", "999"] {
+      app.query = query.into();
+      let started = Instant::now();
+      app.rebuild(None);
+      eprintln!("100k search {query:?}: {:?}", started.elapsed());
+    }
+    let jobs = Arc::try_unwrap(app.jobs).unwrap();
+    let mut app = App::new("Slurm");
+    app.query = "simulation".into();
+    let mut worker = Rebuilder::default();
+    worker.request(&app, Some(jobs), false);
+    let started = Instant::now();
+    let mut heartbeat = Instant::now();
+    let mut worst_gap = Duration::ZERO;
+    let mut heartbeats = 0;
+    tokio::time::timeout(Duration::from_secs(5), async {
+      loop {
+        worker.poll(&mut app).await;
+        worst_gap = worst_gap.max(heartbeat.elapsed());
+        heartbeat = Instant::now();
+        heartbeats += 1;
+        if worker.task.is_none() && worker.pending.is_none() {
+          break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+      }
+    })
+    .await
+    .unwrap();
+    assert_eq!(app.visible.len(), 100_000);
+    eprintln!(
+      "100k background rebuild: {:?}; {heartbeats} UI heartbeats; worst gap {worst_gap:?}",
+      started.elapsed()
+    );
+  }
   #[test]
   fn large_array_formats_only_viewport_rows_and_reuses_them() {
     let backend = ratatui::backend::TestBackend::new(180, 40);

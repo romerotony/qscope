@@ -28,9 +28,10 @@ type Signature = (String, String, String, String);
 pub struct Metadata {
   entries: VecDeque<Entry>,
   signatures: HashMap<String, Option<Signature>>,
-  pub dynamic_ttl: Duration,
+  dynamic_ttl: Duration,
 }
 
+#[cfg(test)]
 impl Default for Metadata {
   fn default() -> Self {
     Self::new(Duration::from_secs(30))
@@ -180,27 +181,16 @@ impl Metadata {
       .await?;
     let job: serde_json::Value = serde_json::from_str(&details)?;
     let allocation = if matches!(job["state"].as_str(), Some("RUN" | "CLEANUP" | "INACTIVE")) {
-      Some(
-        self
-          .fetch(id, "allocation", Duration::from_secs(60), || {
-            backend.info(id, "R")
-          })
-          .await,
-      )
+      self
+        .fetch(id, "allocation", Duration::from_secs(60), || {
+          backend.info(id, "R")
+        })
+        .await
+        .ok()
     } else {
       None
     };
-    let mut resources = crate::resources::flux(
-      &details,
-      &spec,
-      allocation
-        .as_ref()
-        .and_then(|result| result.as_ref().ok())
-        .map(String::as_str),
-    )?;
-    if let Some(Err(error)) = allocation {
-      resources.note = format!("Allocation unavailable: {error:#}");
-    }
+    let mut resources = crate::resources::flux(&details, &spec, allocation.as_deref())?;
     self.advance_elapsed(id, job["state"].as_str().unwrap_or(""), &mut resources);
     Ok(resources)
   }

@@ -12,14 +12,13 @@ pub struct Amounts {
   pub memory: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct Resources {
   pub requested: Amounts,
   pub allocated: Amounts,
   pub elapsed: Option<String>,
   pub limit: Option<String>,
   pub hosts: Option<String>,
-  pub note: String,
 }
 
 fn token<'a>(text: &'a str, key: &str) -> Option<&'a str> {
@@ -94,7 +93,6 @@ pub fn slurm(text: &str) -> Result<Resources> {
     elapsed: token(text, "RunTime=").map(str::to_owned),
     limit: token(text, "TimeLimit=").map(str::to_owned),
     hosts: token(text, "NodeList=").map(str::to_owned),
-    note: "Allocation, not utilization. Tasks are declared, not live processes. Slurm memory uses binary units.".into(),
   })
 }
 
@@ -244,8 +242,6 @@ pub fn flux(job: &str, jobspec: &str, allocation: Option<&str>) -> Result<Resour
       }
     }),
     hosts: job["nodelist"].as_str().map(str::to_owned),
-    note: "Flux CPU counts are cores. Tasks are declared, not live processes; memory unavailable."
-      .into(),
   })
 }
 

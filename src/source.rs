@@ -25,7 +25,7 @@ impl Source {
     match self {
       Self::Live(backend) => cache.resources(backend, id).await,
       Self::Demo(demo) => {
-        demo.jobs();
+        demo.update_runtimes();
         let job = demo
           .jobs
           .iter()
@@ -62,7 +62,6 @@ impl Source {
           } else {
             None
           },
-          note: "DEMO — simulated allocation, not measured utilization.".into(),
         })
       }
     }
@@ -139,7 +138,10 @@ impl Source {
   pub async fn jobs(&mut self) -> Result<Vec<Job>> {
     match self {
       Self::Live(backend) => backend.jobs().await,
-      Self::Demo(demo) => Ok(demo.jobs()),
+      Self::Demo(demo) => {
+        demo.update_runtimes();
+        Ok(demo.jobs.clone())
+      }
     }
   }
 
@@ -244,7 +246,7 @@ impl Demo {
     }
   }
 
-  fn jobs(&mut self) -> Vec<Job> {
+  fn update_runtimes(&mut self) {
     // Advance only active runtimes on refresh. Terminal states stay visible
     // for inspecting results; all state changes reset when the app restarts.
     let elapsed = self.started.elapsed().as_secs();
@@ -253,11 +255,10 @@ impl Demo {
         job.runtime = format!("{}s", elapsed + if i == 0 { 120 } else { 45 });
       }
     }
-    self.jobs.clone()
   }
 
   fn details(&mut self, id: &str) -> Result<String> {
-    self.jobs();
+    self.update_runtimes();
     let job = self
       .jobs
       .iter()
@@ -292,7 +293,7 @@ impl Demo {
 
   fn cancel(&mut self, id: &str) -> Result<()> {
     // Snapshot the runtime before moving to a terminal state.
-    self.jobs();
+    self.update_runtimes();
     let Some(job) = self.jobs.iter_mut().find(|job| job.id == id) else {
       bail!("Unknown demo job: {id}");
     };
@@ -480,8 +481,8 @@ mod tests {
   fn active_runtimes_advance_but_finished_runtimes_do_not() {
     let mut demo = Demo::new(Scheduler::Slurm);
     demo.started = Instant::now() - std::time::Duration::from_secs(30);
-    let jobs = demo.jobs();
-    assert_eq!(jobs[0].runtime, "150s");
-    assert_eq!(jobs[4].runtime, "360s");
+    demo.update_runtimes();
+    assert_eq!(demo.jobs[0].runtime, "150s");
+    assert_eq!(demo.jobs[4].runtime, "360s");
   }
 }
