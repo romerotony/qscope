@@ -658,7 +658,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     return;
   }
   let columns =
-    Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).split(areas[0]);
+    Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(areas[0]);
   let lower_panel = if app.details.is_some() {
     Constraint::Percentage(60)
   } else {
@@ -1213,7 +1213,7 @@ mod tests {
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     assert!(!app.output_maximized);
     assert!(app.output_focus);
-    assert_eq!(app.panes.output.width, 66);
+    assert_eq!(app.panes.output.width, 54);
     assert_eq!(app.selected().unwrap().id, "1");
     assert!(!app.output_follow);
     app.navigate(enter);
