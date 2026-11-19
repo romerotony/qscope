@@ -75,6 +75,7 @@ filter appears in the top border of the Jobs box. Shortcuts are listed in the po
 | Mouse wheel | Scroll the pane under the pointer, one line per event |
 | Left click | Select a job row or focus a pane; clicking another pane closes Details |
 | Double click job | Open and focus Details (two clicks on the same job within 400 ms) |
+| Double click Resources / Details | Switch between Resources and Details for the selected job |
 | Double click stdout | Toggle maximized stdout / split layout |
 | ? | Open / close hotkey menu |
 | h / Left | Focus job list |
@@ -149,7 +150,9 @@ jobspec total and per-slot task counts. Allocated tasks stay `—`
 when the scheduler does not explicitly report them; CPU counts are never used to
 guess how many tasks are running. Demo data includes MPI and threaded layouts.
 
-Details retains keyboard focus until `Enter`, `Esc`, `q`, or a click on Jobs/Stdout closes it. Pane-switching keys and
+Double-clicking Resources opens Details; double-clicking Details returns to
+Resources. Single clicks do not switch views. Details retains keyboard focus until
+`Enter`, `Esc`, `q`, a double-click on Details, or a click on Jobs/Stdout closes it. Pane-switching keys and
 job/filter actions are ignored there; scrolling, help, refresh, and quitting
 remain available.
 
@@ -160,6 +163,15 @@ fields remain accessible in Additional information. Flux epoch timestamps are
 displayed in UTC; Slurm timestamps retain the scheduler's reported timezone.
 Demo mode uses the same formatting. There is no raw-output toggle. Resource and
 stdout lookup still use the original backend responses, not the formatted text.
+
+Under Resources, a compact **CPU/core IDs** entry lists compressed ID ranges per node/hostlist for Slurm
+(`scontrol --details show job ID`) and per execution-target rank for Flux (the
+job's cached `R` allocation). These are allocated resources, not live process
+affinity or utilization. Slurm CPU IDs have topology-dependent core/thread
+semantics; Flux core IDs are not OS logical CPU numbers. Pending jobs show
+`Not allocated`; missing IDs show `Unavailable` rather than being inferred from
+CPU counts. Verbose Slurm details are requested only for the inspector, not on
+routine resource/stdout polls.
 
 Mouse scrolling over Jobs changes the selection; over Stdout it scrolls and
 pauses following. Scrolling back over Jobs leaves Stdout and resumes following.
@@ -228,7 +240,7 @@ through job details.
 - **Slurm:** `squeue --local --me --array --noheader --states=all` with an explicit
   unit-separator format. Lists only jobs currently retained by the controller,
   not historical accounting (`sacct`). Array elements are separate rows.
-  Details use `scontrol show job`; cancellation uses `scancel`.
+  Details use `scontrol --details show job ID`; cancellation uses `scancel`.
 - **Flux:** `flux jobs --json --count=0` lists the current user's pending and
   running jobs without the default 1,000-job cap. IDs are retained as decimal
   strings without floating-point conversion. Details use `flux jobs --json ID`;

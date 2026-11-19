@@ -136,6 +136,20 @@ impl Backend {
     }
   }
 
+  /// Explicit inspector requests include per-node Slurm CPU IDs. Routine
+  /// resource/stdout polls keep using the smaller normal job snapshot.
+  pub async fn inspect(&self, id: &str) -> Result<String> {
+    validate_id(id)?;
+    match self.kind {
+      Scheduler::Slurm => {
+        self
+          .run("scontrol", &["--details", "show", "job", id])
+          .await
+      }
+      _ => self.details(id).await,
+    }
+  }
+
   /// Request cancellation once. Success means the client accepted the request,
   /// not that the job has already disappeared from the scheduler.
   pub async fn cancel(&self, id: &str) -> Result<()> {

@@ -163,7 +163,21 @@ impl Metadata {
         .retain(|entry| entry.id != id || entry.kind != "details");
     }
     self
-      .fetch(id, "details", self.dynamic_ttl, || backend.details(id))
+      .fetch(id, "details", self.dynamic_ttl, || async {
+        if fresh {
+          backend.inspect(id).await
+        } else {
+          backend.details(id).await
+        }
+      })
+      .await
+  }
+
+  pub async fn allocation(&mut self, backend: &Backend, id: &str) -> Result<String> {
+    self
+      .fetch(id, "allocation", Duration::from_secs(60), || {
+        backend.info(id, "R")
+      })
       .await
   }
 
@@ -199,12 +213,7 @@ impl Metadata {
       .await?;
     let job: serde_json::Value = serde_json::from_str(&details)?;
     let allocation = if matches!(job["state"].as_str(), Some("RUN" | "CLEANUP" | "INACTIVE")) {
-      self
-        .fetch(id, "allocation", Duration::from_secs(60), || {
-          backend.info(id, "R")
-        })
-        .await
-        .ok()
+      self.allocation(backend, id).await.ok()
     } else {
       None
     };
@@ -470,15 +479,30 @@ mod tests {
         .await
         .unwrap();
       assert_eq!(
-        std::fs::read_to_string(count_path).unwrap().lines().count(),
+        std::fs::read_to_string(&count_path)
+          .unwrap()
+          .lines()
+          .count(),
         4 // Manual refresh invalidates both caches.
+      );
+      let details = source.details("1", &mut cache).await.unwrap();
+      assert!(details.contains("n1: 0-7"));
+      let calls = std::fs::read_to_string(&count_path).unwrap();
+      assert_eq!(calls.lines().last(), Some("--details show job 1"));
+      source.resources("1", &mut cache).await.unwrap();
+      assert_eq!(
+        std::fs::read_to_string(&count_path)
+          .unwrap()
+          .lines()
+          .count(),
+        5
       );
       return;
     }
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
     let script = directory.path().join("scontrol");
-    std::fs::write(&script, "#!/bin/sh\necho \"$*\" >> \"$QSCOPE_COUNT\"\nif [ \"$2\" = node ]; then\n  [ \"$3\" = n1 ] || exit 1\n  echo 'NodeName=n1 Arch=x86_64 CPUModel=EPYC_9654 ActiveFeatures=zen4'\nelse\n  printf 'JobId=1 JobState=RUNNING ReqTRES=cpu=8,node=1 RunTime=00:00:10 NodeList=n1\\n StdOut=%s\\n StdErr=%s\\n WorkDir=/\\n' \"$QSCOPE_LOG\" \"$QSCOPE_ERR\"\nfi\n").unwrap();
+    std::fs::write(&script, "#!/bin/sh\necho \"$*\" >> \"$QSCOPE_COUNT\"\nif [ \"$2\" = node ]; then\n  [ \"$3\" = n1 ] || exit 1\n  echo 'NodeName=n1 Arch=x86_64 CPUModel=EPYC_9654 ActiveFeatures=zen4'\nelse\n  printf 'JobId=1 JobState=RUNNING ReqTRES=cpu=8,node=1 RunTime=00:00:10 NodeList=n1\\n StdOut=%s\\n StdErr=%s\\n WorkDir=/\\n' \"$QSCOPE_LOG\" \"$QSCOPE_ERR\"\n  if [ \"$1\" = --details ]; then echo ' Nodes=n1 CPU_IDs=0-7'; fi\nfi\n").unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     let log = directory.path().join("job.out");
     std::fs::write(&log, "hello\n").unwrap();
@@ -543,8 +567,21 @@ mod tests {
       cache.clear();
       cache.resources(&backend, "1").await.unwrap();
       assert_eq!(
-        std::fs::read_to_string(count_path).unwrap().lines().count(),
+        std::fs::read_to_string(&count_path)
+          .unwrap()
+          .lines()
+          .count(),
         7
+      );
+      let mut source = crate::source::Source::Live(backend);
+      let details = source.details("1", &mut cache).await.unwrap();
+      assert!(details.contains("Ranks 0"));
+      assert!(details.contains("Ranks 0: 0-7"));
+      let calls = std::fs::read_to_string(&count_path).unwrap();
+      assert_eq!(calls.lines().count(), 8); // Fresh details, cached R.
+      assert_eq!(
+        calls.lines().filter(|line| *line == "job info 1 R").count(),
+        2
       );
       return;
     }

@@ -181,7 +181,19 @@ impl Source {
       Self::Demo(demo) => (demo.kind, demo.details(id)?),
     };
     match kind {
-      Scheduler::Flux => crate::details::flux(&raw),
+      Scheduler::Flux => {
+        let job: serde_json::Value = serde_json::from_str(&raw)?;
+        let allocation = match self {
+          Self::Live(backend)
+            if matches!(job["state"].as_str(), Some("RUN" | "CLEANUP" | "INACTIVE")) =>
+          {
+            cache.allocation(backend, id).await.ok()
+          }
+          Self::Demo(demo) => demo.allocation(id),
+          _ => None,
+        };
+        crate::details::flux(&raw, allocation.as_deref())
+      }
       _ => {
         let formatted = crate::details::slurm(&raw)?;
         Ok(if matches!(self, Self::Demo(_)) {
@@ -208,6 +220,20 @@ pub struct Demo {
 }
 
 impl Demo {
+  fn allocation(&self, id: &str) -> Option<String> {
+    let job = self.jobs.iter().find(|job| job.id == id)?;
+    if !matches!(job.state.as_str(), "RUN" | "RUNNING") {
+      return None;
+    }
+    Some(
+      serde_json::json!({"execution":{"R_lite":[{
+        "rank": if job.nodes == "4" { "0-3" } else { "0" },
+        "children": {"core": if job.nodes == "4" { "0-31" } else { "0-7" }}
+      }]}})
+      .to_string(),
+    )
+  }
+
   fn new(kind: Scheduler) -> Self {
     // Auto has a deterministic default and never initiates live detection.
     let kind = if kind == Scheduler::Flux {
@@ -303,7 +329,7 @@ impl Demo {
           "note": "Simulated data only. No Flux broker is contacted."
       }))?)
     } else {
-      Ok(format!(
+      let mut text = format!(
         "DEMO — simulated Slurm job; no controller is contacted.\n\nJobId={} JobName={}\nUserId={} JobState={}\nPartition={} RunTime={}\nNumNodes={} NumCPUs={}\nReason={}\nWorkDir=/demo/work/{}\nStdOut=/demo/logs/{}.out\nStdErr=/demo/logs/{}.err\n\nPaths are illustrative; no files are accessed.",
         job.id,
         job.name,
@@ -317,7 +343,15 @@ impl Demo {
         job.name,
         job.id,
         job.id
-      ))
+      );
+      if matches!(job.state.as_str(), "RUN" | "RUNNING") {
+        text.push_str(&format!(
+          "\n Nodes={} CPU_IDs={}\n",
+          job.reason,
+          if job.nodes == "4" { "0-31" } else { "0-7" }
+        ));
+      }
+      Ok(text)
     }
   }
 
@@ -348,6 +382,31 @@ impl Demo {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[tokio::test]
+  async fn demo_details_include_allocated_cpu_ids_without_live_commands() {
+    for kind in [Scheduler::Slurm, Scheduler::Flux] {
+      let mut source = Source::demo(kind);
+      let jobs = source.jobs().await.unwrap();
+      let details = source
+        .details(&jobs[0].id, &mut Metadata::default())
+        .await
+        .unwrap();
+      assert!(
+        details
+          .split_once("\nResources\n")
+          .unwrap()
+          .1
+          .contains("CPU/core IDs")
+      );
+      assert!(details.contains(": 0-31"));
+      let pending = source
+        .details(&jobs[2].id, &mut Metadata::default())
+        .await
+        .unwrap();
+      assert!(pending.contains("Not allocated"));
+    }
+  }
   #[tokio::test]
   async fn demo_resources_distinguish_pending_and_running() {
     for kind in [Scheduler::Slurm, Scheduler::Flux] {

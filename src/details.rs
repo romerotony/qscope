@@ -58,6 +58,26 @@ impl Inspector {
     }
   }
 
+  fn cpu_allocation(&mut self, allocations: &[(String, String)], pending: bool) {
+    if allocations.is_empty() {
+      self.row(
+        "CPU/core IDs",
+        if pending {
+          "Not allocated"
+        } else {
+          "Unavailable"
+        },
+      );
+    } else {
+      let lines = allocations
+        .iter()
+        .map(|(node, ids)| format!("{node}: {ids}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+      self.row("CPU/core IDs", &lines);
+    }
+  }
+
   fn finish(mut self) -> String {
     if !self.fields.is_empty() {
       self.text.push_str("\nAdditional information\n");
@@ -116,8 +136,38 @@ fn slurm_fields(text: &str) -> Fields {
   fields
 }
 
+fn slurm_cpu_allocations(text: &str) -> Vec<(String, String)> {
+  let mut allocations = Vec::new();
+  let mut node = None;
+  for line in text.lines().map(str::trim) {
+    // Do not interpret CPU_IDs embedded in commands, comments, or other values.
+    if !line.starts_with("Nodes=") && !line.starts_with("CPU_IDs=") {
+      continue;
+    }
+    let mut fields = slurm_fields(line);
+    if let Some(nodes) = fields.remove("Nodes") {
+      node = Some(nodes);
+    }
+    if let Some(ids) = fields.remove("CPU_IDs")
+      && !ids.is_empty()
+      && !matches!(ids.as_str(), "(null)" | "N/A" | "Unknown")
+      && let Some(node) = &node
+    {
+      allocations.push((node.clone(), ids));
+    }
+  }
+  allocations
+}
+
 pub fn slurm(text: &str) -> Result<String> {
   let mut fields = slurm_fields(text);
+  let allocations = slurm_cpu_allocations(text);
+  let pending = fields
+    .get("JobState")
+    .is_some_and(|state| matches!(state.as_str(), "PENDING" | "CONFIGURING"));
+  // Repeated allocation records must not collapse into unrelated last-node IDs.
+  fields.remove("Nodes");
+  fields.remove("CPU_IDs");
   ensure!(
     fields.contains_key("JobId"),
     "Slurm details did not include JobId"
@@ -179,7 +229,7 @@ pub fn slurm(text: &str) -> Result<String> {
       ("Nice", "Nice"),
     ],
   );
-  view.optional_section(
+  view.section(
     "Resources",
     &[
       ("Requested", "ReqTRES"),
@@ -190,6 +240,7 @@ pub fn slurm(text: &str) -> Result<String> {
       ("CPUs / task", "CPUs/Task"),
     ],
   );
+  view.cpu_allocation(&allocations, pending);
   Ok(view.finish())
 }
 
@@ -216,7 +267,7 @@ fn timestamp(value: &Value) -> String {
     .unwrap_or_else(|| "—".into())
 }
 
-pub fn flux(text: &str) -> Result<String> {
+pub fn flux(text: &str, allocation: Option<&str>) -> Result<String> {
   let job: Value = serde_json::from_str(text).context("Invalid Flux details JSON")?;
   let object = job.as_object().context("Flux details must be an object")?;
   ensure!(
@@ -302,6 +353,32 @@ pub fn flux(text: &str) -> Result<String> {
       ("Return code", "returncode"),
     ],
   );
+  let pending = matches!(
+    job["state"].as_str(),
+    Some("NEW" | "DEPEND" | "PRIORITY" | "SCHED")
+  );
+  let allocation = allocation.and_then(|text| serde_json::from_str::<Value>(text).ok());
+  let allocations: Vec<_> = allocation
+    .as_ref()
+    .and_then(|value| value.pointer("/execution/R_lite"))
+    .and_then(Value::as_array)
+    .map(|ranks| {
+      ranks
+        .iter()
+        .map(|rank| {
+          (
+            format!("Ranks {}", rank["rank"].as_str().unwrap_or("Unknown")),
+            rank
+              .pointer("/children/core")
+              .and_then(Value::as_str)
+              .filter(|ids| !ids.is_empty())
+              .unwrap_or("Unavailable")
+              .to_string(),
+          )
+        })
+        .collect()
+    })
+    .unwrap_or_default();
   view.section(
     "Files",
     &[
@@ -319,7 +396,7 @@ pub fn flux(text: &str) -> Result<String> {
     ],
   );
   view.optional_section("Exception", &[("Exception", "exception")]);
-  view.optional_section(
+  view.section(
     "Resources",
     &[
       ("Nodes", "nnodes"),
@@ -327,6 +404,7 @@ pub fn flux(text: &str) -> Result<String> {
       ("Tasks", "ntasks"),
     ],
   );
+  view.cpu_allocation(&allocations, pending);
   view.optional_section("Demo", &[("Simulated", "demo"), ("Note", "note")]);
   Ok(view.finish())
 }
@@ -334,6 +412,63 @@ pub fn flux(text: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn slurm_cpu_ids_keep_each_node_group_including_wrapped_records() {
+    let text = "JobId=1 JobState=RUNNING NumCPUs=96\n \
+Nodes=n[01-02] CPU_IDs=0-31 Mem=4096\n \
+Nodes=n03 CPU_IDs=32-47,64-79 Mem=4096\n \
+Nodes=n04\n CPU_IDs=8-15\n Command=echo CPU_IDs=not-an-allocation";
+    let formatted = slurm(text).unwrap();
+    for value in [
+      "CPU/core IDs",
+      "n[01-02]: 0-31",
+      "n03: 32-47,64-79",
+      "n04: 8-15",
+    ] {
+      assert!(formatted.contains(value), "{value}");
+    }
+    assert_eq!(formatted.matches("CPU/core IDs").count(), 1);
+    let resources = formatted.split_once("\nResources\n").unwrap().1;
+    assert!(resources.contains("CPU/core IDs"));
+    assert!(!formatted.contains("CPU/core allocation"));
+    assert!(!formatted.contains("Scope"));
+    assert!(!formatted.contains("Meaning"));
+    assert!(!formatted.contains("CPU_IDs           "));
+    assert!(
+      slurm("JobId=1 JobState=PENDING NumCPUs=96")
+        .unwrap()
+        .contains("Not allocated")
+    );
+    let missing = slurm("JobId=1 JobState=RUNNING NumCPUs=96").unwrap();
+    assert!(missing.contains("Unavailable"));
+    assert!(!missing.contains("0-95")); // Never infer CPU IDs from a count.
+  }
+
+  #[test]
+  fn flux_cpu_ids_are_grouped_by_rank_and_missing_allocations_do_not_break_details() {
+    let raw = r#"{"id":1,"state":"RUN","ncores":8}"#;
+    let allocation = r#"{"execution":{"R_lite":[{"rank":"0-1","children":{"core":"0-3"}},{"rank":"2","children":{"core":"8,10-12"}}]}}"#;
+    let formatted = flux(raw, Some(allocation)).unwrap();
+    for value in ["Ranks 0-1: 0-3", "Ranks 2: 8,10-12"] {
+      assert!(formatted.contains(value), "{value}");
+    }
+    assert!(
+      formatted
+        .split_once("\nResources\n")
+        .unwrap()
+        .1
+        .contains("CPU/core IDs")
+    );
+    assert!(!formatted.contains("CPU/core allocation"));
+    assert!(flux(raw, None).unwrap().contains("Unavailable"));
+    assert!(flux(raw, Some("not JSON")).unwrap().contains("Unavailable"));
+    assert!(
+      flux(r#"{"id":1,"state":"SCHED"}"#, None)
+        .unwrap()
+        .contains("Not allocated")
+    );
+  }
 
   #[test]
   fn slurm_preserves_spaces_paths_and_unknown_fields() {
@@ -358,7 +493,7 @@ mod tests {
 
   #[test]
   fn flux_formats_timestamps_failures_and_large_ids_without_json_dump() {
-    let formatted = flux(r#"{"id":18446744073709551614,"name":"sim","state":"INACTIVE","result":"FAILED","t_submit":1,"runtime":750,"userid":1000,"exception":{"occurred":true,"type":"exec","note":"not found"},"extra":{"custom":"retained"}}"#).unwrap();
+    let formatted = flux(r#"{"id":18446744073709551614,"name":"sim","state":"INACTIVE","result":"FAILED","t_submit":1,"runtime":750,"userid":1000,"exception":{"occurred":true,"type":"exec","note":"not found"},"extra":{"custom":"retained"}}"#, None).unwrap();
     for value in [
       "Overview",
       "Timing",
@@ -374,6 +509,6 @@ mod tests {
       assert!(formatted.contains(value), "{value}");
     }
     assert!(!formatted.contains("{\""));
-    assert!(flux("{}").is_err());
+    assert!(flux("{}", None).is_err());
   }
 }

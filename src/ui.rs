@@ -47,6 +47,7 @@ pub struct App {
   pub details_request: Option<String>,
   last_job_click: Option<(String, Instant)>,
   last_output_click: Option<(u16, u16, Instant)>,
+  last_inspector_click: Option<InspectorClick>,
   /// Selected job's resource snapshot, or a diagnostic from its last query.
   pub resources: Option<(String, Result<crate::resources::Resources, String>)>,
   jobs_updated: Instant,
@@ -92,6 +93,14 @@ struct CachedRow {
   searching: bool,
   second: u64,
   row: Row<'static>,
+}
+
+struct InspectorClick {
+  id: String,
+  details: bool,
+  column: u16,
+  row: u16,
+  at: Instant,
 }
 
 /// Only snapshot-derived data crosses the background rebuild boundary.
@@ -284,6 +293,7 @@ impl App {
       details_request: None,
       last_job_click: None,
       last_output_click: None,
+      last_inspector_click: None,
       resources: None,
       jobs_updated: Instant::now(),
       resources_updated: None,
@@ -618,6 +628,7 @@ impl App {
   }
 
   pub fn open_details(&mut self) {
+    self.last_inspector_click = None;
     if let Some(job) = self.selected() {
       let id = job.id.clone();
       self.set_output_focus(false);
@@ -627,6 +638,44 @@ impl App {
       self.details_request = Some(id);
     }
     self.last_job_click = None;
+  }
+
+  fn click_inspector(&mut self, column: u16, row: u16) {
+    self.set_output_focus(false);
+    self.last_job_click = None;
+    self.last_output_click = None;
+    let Some(id) = self.selected().map(|job| job.id.clone()) else {
+      self.last_inspector_click = None;
+      return;
+    };
+    let details = self.details.is_some();
+    let now = Instant::now();
+    let double_click = self.last_inspector_click.as_ref().is_some_and(|previous| {
+      previous.id == id
+        && previous.details == details
+        && column.abs_diff(previous.column) <= 1
+        && row.abs_diff(previous.row) <= 1
+        && now.duration_since(previous.at) <= Duration::from_millis(400)
+    });
+    if double_click {
+      self.last_inspector_click = None;
+      if details {
+        self.details = None;
+        self.details_focus = false;
+        self.details_request = None;
+        self.detail_scroll = 0;
+      } else {
+        self.open_details();
+      }
+    } else {
+      self.last_inspector_click = Some(InspectorClick {
+        id,
+        details,
+        column,
+        row,
+        at: now,
+      });
+    }
   }
 
   pub fn handle_mouse(&mut self, event: MouseEvent) {
@@ -641,16 +690,24 @@ impl App {
     if self.confirm.is_some() || self.searching {
       self.last_job_click = None;
       self.last_output_click = None;
+      self.last_inspector_click = None;
       return;
     }
     if self.help_open {
       self.last_job_click = None;
       self.last_output_click = None;
+      self.last_inspector_click = None;
       if self.panes.help.contains(position) {
         self.help_scroll = self.help_scroll.saturating_add_signed(delta as i16);
       }
       return;
     }
+    if clicked && (self.panes.resources.contains(position) || self.panes.details.contains(position))
+    {
+      self.click_inspector(event.column, event.row);
+      return;
+    }
+    self.last_inspector_click = None;
     // A click on another pane dismisses Details; wheel events elsewhere cannot
     // accidentally move the selected job while Details is open.
     if self.details_focus {
@@ -724,6 +781,7 @@ impl App {
   pub fn navigate(&mut self, key: KeyEvent) -> bool {
     self.last_job_click = None;
     self.last_output_click = None;
+    self.last_inspector_click = None;
     let second_g = self.output_g_pending;
     self.output_g_pending = false;
     if !key
@@ -1146,6 +1204,7 @@ const HELP: &str = "Navigation
   Mouse wheel       Scroll pane under pointer (1 line)
   Left click        Select job / focus pane; closes details when leaving it
   Double click      Open job details / maximize or restore stdout
+  Double click Resources / Details Switch between those views
   Enter in stdout   Maximize / restore stdout
   Esc / q in maximized stdout Restore split layout
 
@@ -1422,6 +1481,84 @@ fn centered(area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn double_clicking_resources_and_details_toggles_the_selected_job_view() {
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 40)).unwrap();
+    let mut app = App::new("Slurm");
+    app.replace_jobs(vec![job("1")]);
+    app.resources = Some(("1".into(), Ok(crate::resources::Resources::default())));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let click = wheel(MouseEventKind::Down(MouseButton::Left), app.panes.resources);
+    app.handle_mouse(click);
+    assert!(app.details.is_none() && app.details_request.is_none());
+    app.handle_mouse(click);
+    assert_eq!(app.details.as_ref().unwrap().0, "1");
+    assert_eq!(app.details_request.as_deref(), Some("1"));
+    assert!(app.details_focus && !app.output_focus);
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let click = wheel(MouseEventKind::Down(MouseButton::Left), app.panes.details);
+    app.handle_mouse(click);
+    assert!(app.details.is_some());
+    app.detail_scroll = 10;
+    app.handle_mouse(click);
+    assert!(app.details.is_none() && app.details_request.is_none());
+    assert!(!app.details_focus && !app.output_focus);
+    assert_eq!(app.detail_scroll, 0);
+    assert!(app.resources.is_some());
+    assert_eq!(app.selected().unwrap().id, "1");
+  }
+
+  #[test]
+  fn inspector_double_click_requires_recent_nearby_clicks_on_the_same_job() {
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 40)).unwrap();
+    let mut app = App::new("Slurm");
+    app.replace_jobs(vec![job("1"), job("2")]);
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let click = wheel(MouseEventKind::Down(MouseButton::Left), app.panes.resources);
+    app.handle_mouse(click);
+    app.last_inspector_click.as_mut().unwrap().at = Instant::now() - Duration::from_millis(500);
+    app.handle_mouse(click);
+    assert!(app.details.is_none());
+    let distant = MouseEvent {
+      column: click.column + 5,
+      ..click
+    };
+    app.handle_mouse(distant);
+    assert!(app.details.is_none());
+    app.table.select(Some(1));
+    app.handle_mouse(distant);
+    assert!(app.details.is_none());
+    app.handle_mouse(wheel(MouseEventKind::ScrollDown, app.panes.resources));
+    app.handle_mouse(distant);
+    assert!(app.details.is_none());
+    app.navigate(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    app.handle_mouse(distant);
+    assert!(app.details.is_none());
+    app.handle_mouse(distant);
+    assert_eq!(app.details_request.as_deref(), Some("2"));
+  }
+
+  #[test]
+  fn inspector_clicks_are_ignored_for_modals_search_and_empty_jobs() {
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 40)).unwrap();
+    let mut app = App::new("Slurm");
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let click = wheel(MouseEventKind::Down(MouseButton::Left), app.panes.resources);
+    app.handle_mouse(click);
+    app.handle_mouse(click);
+    assert!(app.details.is_none());
+    app.replace_jobs(vec![job("1")]);
+    for mode in 0..3 {
+      app.confirm = (mode == 0).then(|| "1".into());
+      app.searching = mode == 1;
+      app.help_open = mode == 2;
+      app.handle_mouse(click);
+      app.handle_mouse(click);
+      assert!(app.details.is_none() && app.details_request.is_none());
+      assert!(app.last_inspector_click.is_none());
+    }
+  }
 
   #[tokio::test]
   async fn rebuild_panics_are_propagated_instead_of_resuming_the_terminal_ui() {
