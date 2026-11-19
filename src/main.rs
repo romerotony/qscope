@@ -6,6 +6,7 @@ mod details;
 mod duration;
 mod metadata;
 mod output;
+mod preview;
 mod resources;
 mod scheduler;
 mod search;

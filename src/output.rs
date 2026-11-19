@@ -68,7 +68,7 @@ pub struct Reader {
   failures: u32,
   retry_at: Option<Instant>,
   last_path: Option<PathBuf>,
-  // Only one tail is retained, bounded by MAX_BYTES. Explicit pages never reuse it.
+  // Retain only one decoded tail from a bounded raw page. Explicit pages never reuse it.
   tail: Option<(PathBuf, String, Page)>,
 }
 
@@ -275,10 +275,7 @@ fn page(
     bytes.truncate(newline + 1);
     end = start + bytes.len() as u64;
   }
-  let text: String = String::from_utf8_lossy(&bytes)
-    .chars()
-    .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
-    .collect();
+  let text = crate::preview::render(&bytes);
   let page = Page {
     start,
     end,
@@ -356,6 +353,31 @@ pub fn slurm_path(details: &str, stream: Stream) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[tokio::test]
+  async fn progress_updates_replay_on_poll_and_keep_raw_file_page_offsets() {
+    use std::io::Write;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("job.err");
+    let first = b"log line\n\rprogress 10%\x1b[";
+    std::fs::write(&path, first).unwrap();
+    let mut reader = Reader::default();
+    let output = reader.read(path.clone(), Position::Tail).await.unwrap();
+    assert_eq!(output.text, "log line\nprogress 10%");
+    assert_eq!(output.page.unwrap().end, first.len() as u64);
+    let mut file = std::fs::OpenOptions::new()
+      .append(true)
+      .open(&path)
+      .unwrap();
+    file.write_all(b"2K\rprogress 20%\nDone\n").unwrap();
+    let output = reader.read(path.clone(), Position::Tail).await.unwrap();
+    assert_eq!(output.text, "log line\nprogress 20%\nDone\n");
+    assert_eq!(output.page.unwrap().end, file.metadata().unwrap().len());
+    assert_eq!(
+      reader.read(path, Position::Tail).await.unwrap().text,
+      output.text
+    );
+  }
 
   #[test]
   fn stderr_uses_its_reported_path_without_guessing_or_falling_back() {

@@ -208,7 +208,13 @@ lines may span pages. The current page and a single pending tail are retained.
 If a file is replaced or truncated during history browsing, a diagnostic asks
 you to resume following rather than mixing unrelated file contents.
 The view follows the newest lines until you navigate within stdout. Long lines are clipped
-to panel width. Invalid UTF-8 is replaced and control characters are stripped.
+to panel width. Invalid UTF-8 is replaced. A bounded, presentation-only decoder
+handles carriage-return overwrites, backspace, common ANSI cursor movement, and
+erase-line sequences, so tqdm progress bars update in place (including nested
+bars). Colors and unsupported escape commands are discarded, never executed by
+your terminal. Each 64 KiB page is decoded independently; cursor movements cannot
+reach earlier pages, and a page starting mid-update may show partial context.
+The original log files and byte-based paging offsets remain unchanged.
 File operations have a UI timeout, though a stalled network-filesystem operation
 may remain in the OS blocking pool until it returns. Only one filesystem task is
 allowed in flight, even after a timeout; retries wait for it and back off up to
