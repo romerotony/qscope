@@ -32,7 +32,7 @@ enum Request {
   Jobs,
   Details(String),
   Cancel(String),
-  Output(String, output::Position, u64),
+  Output(String, output::Stream, output::Position, u64),
   Resources(String),
 }
 /// Results include the requested job ID so details remain tied to the right job
@@ -109,11 +109,23 @@ fn main() -> Result<()> {
     .worker_threads(2)
     .max_blocking_threads(2)
     .build()?;
-  let result = runtime.block_on(async_main());
+  run_with_bounded_shutdown(runtime, |runtime| runtime.block_on(async_main()))
+}
+
+fn run_with_bounded_shutdown<T>(
+  runtime: tokio::runtime::Runtime,
+  run: impl FnOnce(&tokio::runtime::Runtime) -> T,
+) -> T {
+  // A panic must not fall through to Runtime::drop, which can wait forever on
+  // a blocked filesystem syscall. Preserve the original panic after cleanup.
+  let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&runtime)));
   // A stalled NFS syscall cannot be canceled. Do not wait indefinitely for the
   // single tracked blocking read after the terminal has been restored.
   runtime.shutdown_timeout(Duration::from_millis(200));
-  result
+  match result {
+    Ok(result) => result,
+    Err(panic) => std::panic::resume_unwind(panic),
+  }
 }
 
 async fn async_main() -> Result<()> {
@@ -190,9 +202,9 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
           output_reader.invalidate(&id);
           Response::Cancel(id, result)
         }
-        Request::Output(id, position, revision) => {
+        Request::Output(id, stream, position, revision) => {
           let result = backend
-            .output(&id, &mut output_reader, position, &mut cache)
+            .output(&id, &mut output_reader, position, &mut cache, stream)
             .await;
           Response::Output(id, position, revision, result)
         }
@@ -233,7 +245,7 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
   let result: Result<()> = async {
         loop {
             let previous = app.selected().map(|job| (job.id.clone(), job.state.clone(), job.nodes.clone(), job.cores.clone()));
-            if rebuilder.poll(&mut app).await {
+            if rebuilder.poll(&mut app).await? {
                 dirty = true;
                 let current = app.selected().map(|job| (job.id.clone(), job.state.clone(), job.nodes.clone(), job.cores.clone()));
                 if current != previous {
@@ -268,7 +280,7 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
             if !busy && app.confirm.is_none()
                 && let Some(id) = selected_id.clone()
                 && let Some(position) = app.output_request.take() {
-                requests.send((generation, Request::Output(id, position, app.output_revision))).await?;
+                requests.send((generation, Request::Output(id, app.output_stream, position, app.output_revision))).await?;
                 busy = true;
             }
             // Pause refreshes during confirmation and capture the target ID
@@ -288,7 +300,7 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
             if !busy && app.confirm.is_none() && Instant::now() >= next_output
                 && selection_gate.settled(Instant::now()) && app.resources.is_some()
                 && let Some(id) = selected_id {
-                requests.send((generation, Request::Output(id, output::Position::Tail, app.output_revision))).await?;
+                requests.send((generation, Request::Output(id, app.output_stream, output::Position::Tail, app.output_revision))).await?;
                 busy = true;
             }
             let second = clock_started.elapsed().as_secs();
@@ -346,7 +358,7 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
                                         app.output_page_failed();
                                         if app.output_follow {
                                             app.output_path.clear();
-                                            app.replace_output(format!("Stdout unavailable: {error:#}"));
+                                            app.replace_output(format!("{} unavailable: {error:#}", app.output_stream.title()));
                                         } else {
                                             app.status = format!("Output read failed: {error:#}");
                                         }
@@ -448,6 +460,30 @@ async fn run(mut backend: Source, config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn panic_shutdown_is_bounded_with_an_outstanding_filesystem_task() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+      .worker_threads(2)
+      .enable_all()
+      .build()
+      .unwrap();
+    let (release, wait) = std::sync::mpsc::channel();
+    let (started, ready) = std::sync::mpsc::channel();
+    runtime.spawn_blocking(move || {
+      let _ = started.send(());
+      let _ = wait.recv();
+    });
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    let start = Instant::now();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      run_with_bounded_shutdown(runtime, |_| panic!("simulated UI failure"));
+    }));
+    let elapsed = start.elapsed();
+    let _ = release.send(());
+    assert!(result.is_err());
+    assert!(elapsed < Duration::from_secs(2));
+  }
 
   #[test]
   fn terminal_stdout_polling_is_slower_without_overriding_slower_configuration() {

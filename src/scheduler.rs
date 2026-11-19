@@ -30,6 +30,23 @@ pub struct Backend {
 }
 
 impl Backend {
+  pub async fn nodes(&self, hosts: &str) -> Result<String> {
+    ensure!(
+      self.kind == Scheduler::Slurm,
+      "Node metadata requires Slurm"
+    );
+    // Hostlists remain one CLI argument; reject options and non-hostlist syntax.
+    ensure!(
+      !hosts.is_empty()
+        && !hosts.starts_with('-')
+        && hosts
+          .chars()
+          .all(|c| c.is_ascii_alphanumeric() || "_-.,[]".contains(c)),
+      "Unsafe node list: {hosts}"
+    );
+    self.run("scontrol", &["show", "node", hosts]).await
+  }
+
   pub async fn info(&self, id: &str, attribute: &str) -> Result<String> {
     validate_id(id)?;
     ensure!(
@@ -282,6 +299,23 @@ fn parse_flux(text: &str) -> Result<Vec<Job>> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  #[tokio::test]
+  async fn node_queries_reject_options_and_non_hostlist_input() {
+    let backend = Backend {
+      kind: Scheduler::Slurm,
+      timeout: Duration::from_secs(1),
+    };
+    for hosts in ["", "-a", "n1 n2", "n1;id", "n1\nn2", "n1/../n2"] {
+      assert!(
+        backend
+          .nodes(hosts)
+          .await
+          .unwrap_err()
+          .to_string()
+          .contains("Unsafe node list")
+      );
+    }
+  }
   #[tokio::test]
   async fn command_errors_are_actionable() {
     let backend = Backend {

@@ -93,6 +93,7 @@ filter appears in the top border of the Jobs box. Shortcuts are listed in the po
 | Ctrl-b / Ctrl-f (text pane focused) | Same as Ctrl-u / Ctrl-d |
 | gg / Home (stdout focused) | Jump to beginning of the stdout file |
 | G / End (stdout focused) | Resume following newest output |
+| e / o | Select stderr / stdout in the output panel |
 | Page Up / Page Down (stdout focused) | Scroll back / toward newest output |
 | End (stdout focused) | Resume following newest output |
 | c | Cancel selected job; requires explicit `y` confirmation |
@@ -133,6 +134,15 @@ as unavailable. Missing fields show `—`, not a guessed zero. These are schedul
 allocations, **not** CPU activity, memory consumption, or GPU utilization.
 Demo mode provides simulated requested and allocated resources.
 
+Below Nodes, the panel shows CPU/GPU models, architecture, and site-defined
+Features. Slurm GPU models come from typed **allocated** TRES. Node metadata is
+queried once per hostlist and cached for five minutes (failed lookups for one
+minute); `r` clears it. CPU models are shown only when explicitly reported via
+`CPUModel`; standard Slurm often exposes only architecture and node features.
+Flux displays properties from the concrete job allocation as Features without
+guessing hardware models. Unavailable models show `Unknown`. No SSH, remote
+hardware probing, or job-side commands are used.
+
 The Tasks row describes declared task counts, not currently active processes.
 Slurm uses `NumTasks`, with task TRES where explicitly provided. Flux supports
 jobspec total and per-slot task counts. Allocated tasks stay `—`
@@ -158,7 +168,13 @@ another pane to leave. An open help menu accepts wheel scrolling and blocks chan
 to panes behind it. Mouse capture is enabled during the TUI and disabled on exit;
 many terminals allow native text selection by holding Shift.
 
-### Slurm stdout panel
+### Slurm stdout / stderr panel
+
+Press `e` to show stderr or `o` to show stdout (the default). The title identifies
+the active stream. Switching resumes following and clears the previous stream's
+paging history; the choice stays selected when you move between jobs. These keys
+work from any pane except while editing a filter or in help/confirmation dialogs.
+Each stream uses its scheduler-reported path, not a guessed `.out`/`.err` filename.
 
 The right-hand panel follows the selected job and refreshes its output at the
 stdout interval (one second by default) when the worker is available. Set it with
@@ -168,7 +184,7 @@ Resources refresh every 30 seconds (`--resource-refresh SECONDS` or
 `resource_refresh_interval_secs`). Running elapsed clocks advance locally each second
 between snapshots without querying the scheduler. `r` requests an immediate
 refresh of all three; slow reads remain serialized and may stretch the cadence.
-The viewer resolves `StdOut` and `WorkDir` from
+The viewer resolves `StdOut` / `StdErr` and `WorkDir` from
 `scontrol show job` and shares its metadata with Resources. It keeps up to 32
 resolved paths for 60 seconds, rather than resolving again on each selection. It does not assume
 the default filename. Paths with spaces, relative paths, and unresolved `%j`,
@@ -197,7 +213,7 @@ File operations have a UI timeout, though a stalled network-filesystem operation
 may remain in the OS blocking pool until it returns. Only one filesystem task is
 allowed in flight, even after a timeout; retries wait for it and back off up to
 60 seconds. Normal shutdown waits at most 200 ms for blocking work after terminal
-cleanup; this does not cancel a stalled OS syscall. Live Flux stdout is not yet
+cleanup; this does not cancel a stalled OS syscall. Live Flux stdout/stderr is not yet
 supported; demo mode provides simulated logs for both scheduler styles.
 
 The job table uses fewer columns in narrow layouts; full fields remain available
@@ -218,7 +234,7 @@ through job details.
   to every operation. Cancellation is not retried automatically.
 - Choose an interval appropriate to your site's scheduler policy; `--refresh 30`
   or longer is preferable for large installations. Manual refreshes are coalesced.
-- No submission, historical accounting, stderr preview, resource-utilization
+- No submission, historical accounting, resource-utilization
   sampling, or combined scheduler view in this initial version.
 
 ## HPC load controls
@@ -252,6 +268,26 @@ mock Slurm/Flux command counts, selection debounce, and a 100,000-job rendering
 case. These are functional/load-regression tests, not measured HPC benchmarks.
 Use your site's scheduler polling policy; `--refresh 30` is still recommended
 for large installations.
+
+## Troubleshooting crashes or apparent freezes
+
+`Ctrl-C` exits regardless of the focused pane or filter mode; `q` can instead
+close Details/help or be entered into the filter. Rebuild-worker failures now
+exit rather than continuing after the panic hook has restored terminal settings.
+Runtime shutdown is bounded on both normal exits and unwinding panics.
+
+To capture a failure, run with `RUST_BACKTRACE=1` and redirect stderr to a file
+on a writable local filesystem, for example:
+
+```sh
+RUST_BACKTRACE=1 ./target/release/qscope --scheduler slurm 2>qscope-error.log
+```
+
+Share the error log, scheduler, version/commit, and whether `Ctrl-C` responded.
+If the shell remains garbled after the process exits, run `stty sane`.
+Startup at “Checking scheduler connectivity…” waits for scheduler probes up to
+the configured command timeout. Setting `--scheduler slurm` or `--scheduler flux`
+avoids probing the other backend; it does not eliminate controller delays.
 
 ## Development
 

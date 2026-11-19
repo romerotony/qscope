@@ -1,4 +1,4 @@
-//! Bounded, read-only stdout previews. Never execute file contents or read a whole
+//! Bounded, read-only stdout/stderr previews. Never execute file contents or read a whole
 //! potentially multi-gigabyte job log into memory.
 
 use anyhow::{Context, Result, ensure};
@@ -11,6 +11,29 @@ use std::{
 };
 
 const MAX_BYTES: u64 = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stream {
+  #[default]
+  Stdout,
+  Stderr,
+}
+
+impl Stream {
+  pub fn name(self) -> &'static str {
+    match self {
+      Self::Stdout => "stdout",
+      Self::Stderr => "stderr",
+    }
+  }
+
+  pub fn title(self) -> &'static str {
+    match self {
+      Self::Stdout => "Stdout",
+      Self::Stderr => "Stderr",
+    }
+  }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Page {
@@ -39,7 +62,7 @@ pub struct Output {
 }
 
 pub struct Reader {
-  cached: VecDeque<(String, PathBuf, Instant)>,
+  cached: VecDeque<CachedPath>,
   in_flight: Option<tokio::task::JoinHandle<Result<(String, Page)>>>,
   timeout: Duration,
   failures: u32,
@@ -47,6 +70,13 @@ pub struct Reader {
   last_path: Option<PathBuf>,
   // Only one tail is retained, bounded by MAX_BYTES. Explicit pages never reuse it.
   tail: Option<(PathBuf, String, Page)>,
+}
+
+struct CachedPath {
+  id: String,
+  stream: Stream,
+  path: PathBuf,
+  sampled: Instant,
 }
 
 impl Default for Reader {
@@ -64,24 +94,35 @@ impl Default for Reader {
 }
 
 impl Reader {
-  pub fn path(&self, id: &str) -> Option<PathBuf> {
+  pub fn path(&self, id: &str, stream: Stream) -> Option<PathBuf> {
     self
       .cached
       .iter()
-      .find(|(job, _, at)| job == id && at.elapsed() < Duration::from_secs(60))
-      .map(|(_, path, _)| path.clone())
+      .find(|entry| {
+        entry.id == id
+          && entry.stream == stream
+          && entry.sampled.elapsed() < Duration::from_secs(60)
+      })
+      .map(|entry| entry.path.clone())
   }
 
-  pub fn remember(&mut self, id: &str, path: PathBuf) {
-    self.invalidate(id);
+  pub fn remember(&mut self, id: &str, stream: Stream, path: PathBuf) {
+    self
+      .cached
+      .retain(|entry| entry.id != id || entry.stream != stream);
     if self.cached.len() == 32 {
       self.cached.pop_front();
     }
-    self.cached.push_back((id.into(), path, Instant::now()));
+    self.cached.push_back(CachedPath {
+      id: id.into(),
+      stream,
+      path,
+      sampled: Instant::now(),
+    });
   }
 
   pub fn invalidate(&mut self, id: &str) {
-    self.cached.retain(|(job, _, _)| job != id);
+    self.cached.retain(|entry| entry.id != id);
     self.tail = None;
   }
 
@@ -116,7 +157,7 @@ impl Reader {
     if let Some(pending) = &self.in_flight {
       ensure!(
         pending.is_finished(),
-        "A previous stdout read is still blocked; waiting without starting another"
+        "A previous output read is still blocked; waiting without starting another"
       );
       // The timed-out result belongs to an old request. Drain it, never display it.
       let _ = self.in_flight.take().unwrap().await;
@@ -128,7 +169,7 @@ impl Reader {
     }
     ensure!(
       self.retry_at.is_none_or(|at| Instant::now() >= at),
-      "Stdout reads are backing off after a filesystem failure"
+      "Output reads are backing off after a filesystem failure"
     );
     self.in_flight = Some(tokio::task::spawn_blocking(task));
     let result = tokio::time::timeout(self.timeout, self.in_flight.as_mut().unwrap()).await;
@@ -136,7 +177,7 @@ impl Reader {
       Ok(result) => {
         self.in_flight.take();
         result
-          .context("Stdout read task failed")
+          .context("Output read task failed")
           .and_then(|value| value)
       }
       Err(_) => Err(anyhow::anyhow!(
@@ -259,7 +300,7 @@ fn page(
 
 /// scontrol's normal multi-line output places StdOut and WorkDir on their own
 /// lines. Preserve spaces in these paths instead of splitting on whitespace.
-pub fn slurm_path(details: &str) -> Result<PathBuf> {
+pub fn slurm_path(details: &str, stream: Stream) -> Result<PathBuf> {
   let line_field = |name: &str| {
     details
       .lines()
@@ -270,10 +311,16 @@ pub fn slurm_path(details: &str) -> Result<PathBuf> {
       .split_whitespace()
       .find_map(|token| token.strip_prefix(name))
   };
-  let template = line_field("StdOut=").context("Slurm did not report a StdOut path")?;
+  let field = match stream {
+    Stream::Stdout => "StdOut=",
+    Stream::Stderr => "StdErr=",
+  };
+  let template =
+    line_field(field).with_context(|| format!("Slurm did not report a {} path", stream.name()))?;
   ensure!(
     !template.is_empty() && template != "(null)",
-    "No stdout file is configured for this job"
+    "No {} file is configured for this job",
+    stream.name()
   );
   let mut expanded = String::new();
   let mut chars = template.chars();
@@ -290,9 +337,9 @@ pub fn slurm_path(details: &str) -> Result<PathBuf> {
         .context("Missing job ID for %A")?,
       Some('a') => token_field("ArrayTaskId=").unwrap_or("4294967294"),
       Some(pattern) => anyhow::bail!(
-        "Unresolved Slurm stdout pattern %{pattern}; cannot determine a single output file"
+        "Unresolved Slurm output pattern %{pattern}; cannot determine a single output file"
       ),
-      None => anyhow::bail!("Incomplete stdout filename pattern"),
+      None => anyhow::bail!("Incomplete output filename pattern"),
     };
     expanded.push_str(value);
   }
@@ -301,7 +348,7 @@ pub fn slurm_path(details: &str) -> Result<PathBuf> {
     return Ok(path);
   }
   let workdir =
-    PathBuf::from(line_field("WorkDir=").context("Relative stdout path without WorkDir")?);
+    PathBuf::from(line_field("WorkDir=").context("Relative output path without WorkDir")?);
   ensure!(workdir.is_absolute(), "Slurm WorkDir is not absolute");
   Ok(workdir.join(path))
 }
@@ -309,6 +356,35 @@ pub fn slurm_path(details: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn stderr_uses_its_reported_path_without_guessing_or_falling_back() {
+    let details = "JobId=42 ArrayJobId=40 ArrayTaskId=2\nStdOut=/logs/results.log\nStdErr=errors %A_%a_%j_%%.log\nWorkDir=/shared/work";
+    assert_eq!(
+      slurm_path(details, Stream::Stderr).unwrap(),
+      PathBuf::from("/shared/work/errors 40_2_42_%.log")
+    );
+    assert_eq!(
+      slurm_path(details, Stream::Stdout).unwrap(),
+      PathBuf::from("/logs/results.log")
+    );
+    for details in [
+      "StdOut=/logs/output.out",
+      "StdErr=(null)",
+      "StdErr=",
+      "StdErr=bad-%N.err",
+    ] {
+      assert!(slurm_path(details, Stream::Stderr).is_err());
+    }
+    assert_eq!(
+      slurm_path(
+        "StdErr=/logs/merged.log\nStdOut=/logs/merged.log",
+        Stream::Stderr
+      )
+      .unwrap(),
+      PathBuf::from("/logs/merged.log")
+    );
+  }
 
   #[tokio::test]
   async fn unchanged_tail_reuses_content_but_changes_and_paging_read_again() {
@@ -465,15 +541,19 @@ mod tests {
   fn path_cache_is_bounded_and_invalidated_explicitly() {
     let mut reader = Reader::default();
     for i in 0..40 {
-      reader.remember(&i.to_string(), PathBuf::from(format!("/{i}")));
+      reader.remember(
+        &i.to_string(),
+        Stream::Stdout,
+        PathBuf::from(format!("/{i}")),
+      );
     }
     assert_eq!(reader.cached.len(), 32);
-    assert!(reader.path("0").is_none());
-    assert!(reader.path("39").is_some());
+    assert!(reader.path("0", Stream::Stdout).is_none());
+    assert!(reader.path("39", Stream::Stdout).is_some());
     reader.invalidate("39");
-    assert!(reader.path("39").is_none());
-    reader.cached.back_mut().unwrap().2 = Instant::now() - Duration::from_secs(61);
-    assert!(reader.path("38").is_none());
+    assert!(reader.path("39", Stream::Stdout).is_none());
+    reader.cached.back_mut().unwrap().sampled = Instant::now() - Duration::from_secs(61);
+    assert!(reader.path("38", Stream::Stdout).is_none());
   }
 
   #[tokio::test]
@@ -561,16 +641,16 @@ mod tests {
   fn resolves_paths_with_spaces_and_array_patterns() {
     let details = "JobId=123 JobName=sim\n ArrayJobId=100 ArrayTaskId=7\n WorkDir=/shared/my work\n StdOut=logs/slurm-%A_%a-%j-%%.out\n StdErr=/other";
     assert_eq!(
-      slurm_path(details).unwrap(),
+      slurm_path(details, Stream::Stdout).unwrap(),
       PathBuf::from("/shared/my work/logs/slurm-100_7-123-%.out")
     );
     assert_eq!(
-      slurm_path("StdOut=/shared/path with spaces.out").unwrap(),
+      slurm_path("StdOut=/shared/path with spaces.out", Stream::Stdout).unwrap(),
       PathBuf::from("/shared/path with spaces.out")
     );
-    assert!(slurm_path("StdOut=slurm-%N.out\nWorkDir=/work").is_err());
-    assert!(slurm_path("StdOut=(null)").is_err());
-    assert!(slurm_path("JobId=1").is_err());
+    assert!(slurm_path("StdOut=slurm-%N.out\nWorkDir=/work", Stream::Stdout).is_err());
+    assert!(slurm_path("StdOut=(null)", Stream::Stdout).is_err());
+    assert!(slurm_path("JobId=1", Stream::Stdout).is_err());
   }
 
   #[tokio::test]
@@ -592,8 +672,19 @@ mod tests {
   #[test]
   fn cache_is_specific_to_job() {
     let mut reader = Reader::default();
-    reader.remember("1", PathBuf::from("/one"));
-    assert!(reader.path("1").is_some());
-    assert!(reader.path("2").is_none());
+    reader.remember("1", Stream::Stdout, PathBuf::from("/one"));
+    reader.remember("1", Stream::Stderr, PathBuf::from("/errors"));
+    assert_eq!(
+      reader.path("1", Stream::Stdout),
+      Some(PathBuf::from("/one"))
+    );
+    assert_eq!(
+      reader.path("1", Stream::Stderr),
+      Some(PathBuf::from("/errors"))
+    );
+    assert!(reader.path("2", Stream::Stdout).is_none());
+    reader.invalidate("1");
+    assert!(reader.path("1", Stream::Stdout).is_none());
+    assert!(reader.path("1", Stream::Stderr).is_none());
   }
 }

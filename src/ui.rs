@@ -3,6 +3,7 @@
 
 use crate::scheduler::Job;
 use crate::search::{JobMatch, Search};
+use anyhow::Context;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
   Frame,
@@ -53,6 +54,7 @@ pub struct App {
   /// Stdout follows selection. Pausing retains a stable snapshot and cursor;
   /// refreshed output is buffered until the user explicitly resumes following.
   pub output_id: Option<String>,
+  pub output_stream: crate::output::Stream,
   pub output_path: String,
   output_text: String,
   output_cursor: usize,
@@ -124,11 +126,7 @@ impl JobView {
           .cmp(&state_order(&b.state))
           .then(a.state.cmp(&b.state))
           .then(a.id.cmp(&b.id)),
-        // Numeric IDs sort naturally; compound IDs retain their full text.
-        _ => match (a.id.parse::<u64>(), b.id.parse::<u64>()) {
-          (Ok(a), Ok(b)) => a.cmp(&b),
-          _ => a.id.cmp(&b.id),
-        },
+        _ => compare_job_ids(&a.id, &b.id),
       }
     });
     let mut max_running_seconds = None;
@@ -217,11 +215,19 @@ impl Rebuilder {
     });
   }
 
-  pub async fn poll(&mut self, app: &mut App) -> bool {
+  pub async fn poll(&mut self, app: &mut App) -> anyhow::Result<bool> {
     let mut changed = false;
     if self.task.as_ref().is_some_and(|task| task.is_finished()) {
-      match self.task.take().unwrap().await {
-        Ok((revision, preserve, mut view)) if revision == self.revision => {
+      // Ratatui's global panic hook restores terminal settings even for a worker
+      // panic. Continuing the UI after one would leave it outside raw mode.
+      match self
+        .task
+        .take()
+        .unwrap()
+        .await
+        .context("Job view rebuild task failed")?
+      {
+        (revision, preserve, mut view) if revision == self.revision => {
           let id = preserve
             .then(|| app.selected().map(|job| job.id.clone()))
             .flatten();
@@ -230,11 +236,7 @@ impl Rebuilder {
           self.retired = Some(view);
           changed = true;
         }
-        Err(error) => {
-          app.status = format!("Job view rebuild failed: {error}");
-          changed = true;
-        }
-        Ok((_, _, view)) => self.retired = Some(view),
+        (_, _, view) => self.retired = Some(view),
       }
     }
     if self.task.is_none()
@@ -254,7 +256,7 @@ impl Rebuilder {
         (revision, request.preserve_selection, view)
       }));
     }
-    changed
+    Ok(changed)
   }
 }
 
@@ -286,6 +288,7 @@ impl App {
       jobs_updated: Instant::now(),
       resources_updated: None,
       output_id: None,
+      output_stream: crate::output::Stream::default(),
       output_path: String::new(),
       output_text: String::new(),
       output_cursor: 0,
@@ -452,7 +455,7 @@ impl App {
 
   pub fn reset_output(&mut self) {
     self.last_output_click = None;
-    self.output_text = "Loading stdout…".into();
+    self.output_text = format!("Loading {}…", self.output_stream.name());
     self.output_path.clear();
     self.output_cursor = 0;
     self.output_top = 0;
@@ -474,6 +477,14 @@ impl App {
       // Keep at most one pending tail, bounded by the reader's page size.
       // Holding the displayed snapshot also survives file rotation/truncation.
       self.output_pending = Some(text);
+    }
+  }
+
+  fn set_output_stream(&mut self, stream: crate::output::Stream) {
+    if self.output_stream != stream {
+      self.output_stream = stream;
+      self.reset_output();
+      self.output_request = Some(crate::output::Position::Tail);
     }
   }
 
@@ -715,6 +726,20 @@ impl App {
     self.last_output_click = None;
     let second_g = self.output_g_pending;
     self.output_g_pending = false;
+    if !key
+      .modifiers
+      .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+      let stream = match key.code {
+        KeyCode::Char('e') => Some(crate::output::Stream::Stderr),
+        KeyCode::Char('o') => Some(crate::output::Stream::Stdout),
+        _ => None,
+      };
+      if let Some(stream) = stream {
+        self.set_output_stream(stream);
+        return true;
+      }
+    }
     if self.output_focus {
       match key.code {
         KeyCode::Enter => {
@@ -877,6 +902,37 @@ fn state_order(state: &str) -> u8 {
   }
 }
 
+/// One consistent natural ordering for ordinary, array, and heterogeneous IDs.
+/// Mixing numeric comparison with lexicographic fallback creates cycles, e.g.
+/// 2 < 10 < 11_1 < 2, which violates sort's contract and may panic.
+fn compare_job_ids(left: &str, right: &str) -> std::cmp::Ordering {
+  use std::cmp::Ordering;
+  let (mut a, mut b) = (left.as_bytes(), right.as_bytes());
+  while !a.is_empty() && !b.is_empty() {
+    let order = if a[0].is_ascii_digit() && b[0].is_ascii_digit() {
+      let na = a.iter().take_while(|byte| byte.is_ascii_digit()).count();
+      let nb = b.iter().take_while(|byte| byte.is_ascii_digit()).count();
+      let digits_a = &a[a[..na].iter().position(|&byte| byte != b'0').unwrap_or(na)..na];
+      let digits_b = &b[b[..nb].iter().position(|&byte| byte != b'0').unwrap_or(nb)..nb];
+      a = &a[na..];
+      b = &b[nb..];
+      digits_a
+        .len()
+        .cmp(&digits_b.len())
+        .then(digits_a.cmp(digits_b))
+    } else {
+      let order = a[0].cmp(&b[0]);
+      a = &a[1..];
+      b = &b[1..];
+      order
+    };
+    if order != Ordering::Equal {
+      return order;
+    }
+  }
+  a.len().cmp(&b.len()).then(left.cmp(right))
+}
+
 /// Render the job table, optional details, bottom status bar, and modal overlay.
 /// Ratatui updates table scroll state when rendering the selected row.
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -928,7 +984,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
   let lower_panel = if app.details.is_some() {
     Constraint::Percentage(60)
   } else {
-    Constraint::Length(13)
+    Constraint::Length(16)
   };
   let panels = Layout::vertical([Constraint::Min(4), lower_panel]).split(columns[0]);
   app.panes.jobs = panels[0];
@@ -1112,6 +1168,7 @@ Scrolling
   G / End           Follow latest stdout (stdout focused)
 
 General
+  e / o             Show stderr / stdout in the output pane
   ?                 Open / close this menu
   q                 Close details/help if focused; otherwise quit
   Ctrl-c            Quit immediately
@@ -1248,14 +1305,28 @@ fn draw_resources(frame: &mut Frame, app: &App, area: Rect) {
   );
   frame.render_widget(
     Paragraph::new(format!(
-      "Elapsed: {} · Limit: {}\n\nNodes: {}",
+      "Elapsed: {} · Limit: {}\n\nNodes: {}\nCPU: {}\nGPU: {}\nArchitecture: {}\nFeatures: {}",
       crate::duration::elapsed_since(
         resources.elapsed.as_deref().unwrap_or("—"),
         app.selected().map_or("", |job| job.state.as_str()),
         app.resources_updated.map_or(0, |at| at.elapsed().as_secs()),
       ),
       show(&resources.limit),
-      show(&resources.hosts)
+      show(&resources.hosts),
+      resources.hardware.cpu_model.as_deref().unwrap_or("Unknown"),
+      resources.hardware.gpu_model.as_deref().unwrap_or(
+        if resources.allocated.gpus.as_deref() == Some("0") {
+          "None allocated"
+        } else {
+          "Unknown"
+        }
+      ),
+      resources
+        .hardware
+        .architecture
+        .as_deref()
+        .unwrap_or("Unknown"),
+      show(&resources.hardware.features),
     ))
     .wrap(Wrap { trim: false }),
     parts[1],
@@ -1291,21 +1362,28 @@ fn draw_output(frame: &mut Frame, app: &mut App, area: Rect) {
     .unwrap_or_default();
   let title = match &app.output_id {
     Some(id) => format!(
-      " Stdout: {id} · {}{filename} ",
+      " {}: {id} · {}{filename} ",
+      app.output_stream.title(),
       if app.output_follow {
         "following"
       } else {
         "paused"
       }
     ),
-    None => " Stdout ".into(),
+    None => format!(" {} ", app.output_stream.title()),
   };
   let block = panel(app.output_focus).title(title);
   let inner = block.inner(area);
   frame.render_widget(block, area);
   app.panes.output_text = inner;
   if app.output_id.is_none() {
-    frame.render_widget(Paragraph::new("Select a job to preview its stdout."), inner);
+    frame.render_widget(
+      Paragraph::new(format!(
+        "Select a job to preview its {}.",
+        app.output_stream.name()
+      )),
+      inner,
+    );
     return;
   }
   // Slice by lines rather than Paragraph's u16 scroll offset. Reads are bounded,
@@ -1345,10 +1423,191 @@ fn centered(area: Rect) -> Rect {
 mod tests {
   use super::*;
 
+  #[tokio::test]
+  async fn rebuild_panics_are_propagated_instead_of_resuming_the_terminal_ui() {
+    let mut app = App::new("Slurm");
+    let mut worker = Rebuilder {
+      task: Some(tokio::task::spawn_blocking(|| {
+        panic!("simulated rebuild failure")
+      })),
+      ..Default::default()
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+      while !worker.task.as_ref().unwrap().is_finished() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+      }
+    })
+    .await
+    .unwrap();
+    let error = worker.poll(&mut app).await.unwrap_err();
+    assert!(format!("{error:#}").contains("simulated rebuild failure"));
+    assert!(worker.task.is_none());
+  }
+
+  #[test]
+  fn mixed_job_id_order_is_transitive_and_handles_arrays_and_large_numbers() {
+    let ids = [
+      "",
+      "0",
+      "00",
+      "1",
+      "01",
+      "1_2",
+      "1_10",
+      "2",
+      "10",
+      "11_1",
+      "20+1",
+      "100",
+      "18446744073709551615",
+      "18446744073709551616",
+      "ƒ2",
+      "ƒ10",
+    ];
+    for a in ids {
+      assert!(compare_job_ids(a, a).is_eq());
+      for b in ids {
+        assert_eq!(compare_job_ids(a, b), compare_job_ids(b, a).reverse());
+        for c in ids {
+          if compare_job_ids(a, b).is_le() && compare_job_ids(b, c).is_le() {
+            assert!(compare_job_ids(a, c).is_le(), "{a:?} <= {b:?} <= {c:?}");
+          }
+        }
+      }
+    }
+    let mut sample = ["11_1", "10", "2", "11_10", "11_2"];
+    sample.sort_by(|a, b| compare_job_ids(a, b));
+    assert_eq!(sample, ["2", "10", "11_1", "11_2", "11_10"]);
+  }
+
+  #[test]
+  fn repeated_mixed_array_snapshots_rebuild_without_panicking() {
+    let mut app = App::new("Slurm");
+    app.sort = 0;
+    for snapshot in 0..100 {
+      let jobs = (0..1000)
+        .rev()
+        .map(|i| {
+          let id = if (i + snapshot) % 3 == 0 {
+            format!("{}_{}", i / 10, i % 10)
+          } else {
+            i.to_string()
+          };
+          job(&id)
+        })
+        .collect();
+      app.replace_jobs(jobs);
+      assert!(
+        app
+          .visible
+          .windows(2)
+          .all(|pair| { compare_job_ids(&app.jobs[pair[0]].id, &app.jobs[pair[1]].id).is_le() })
+      );
+    }
+  }
+
+  #[test]
+  fn hardware_information_renders_below_nodes_and_missing_models_are_explicit() {
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 40)).unwrap();
+    let mut app = App::new("Slurm");
+    app.replace_jobs(vec![job("1")]);
+    let mut resources =
+      crate::resources::slurm("JobId=1 NodeList=n1 AllocTRES=gres/gpu:a100=2").unwrap();
+    resources.hardware.cpu_model = Some("EPYC 9654".into());
+    resources.hardware.architecture = Some("x86_64".into());
+    app.resources = Some(("1".into(), Ok(resources)));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text: String = terminal
+      .backend()
+      .buffer()
+      .content
+      .iter()
+      .map(|cell| cell.symbol())
+      .collect();
+    let nodes = text.find("Nodes: n1").unwrap();
+    let cpu = text.find("CPU: EPYC 9654").unwrap();
+    let gpu = text.find("GPU: a100").unwrap();
+    assert!(nodes < cpu && cpu < gpu);
+    assert!(text.contains("Architecture: x86_64"));
+    app.resources = Some(("1".into(), Ok(crate::resources::Resources::default())));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text: String = terminal
+      .backend()
+      .buffer()
+      .content
+      .iter()
+      .map(|cell| cell.symbol())
+      .collect();
+    assert!(text.contains("CPU: Unknown"));
+    assert!(text.contains("GPU: Unknown"));
+  }
+
+  #[test]
+  fn stream_keys_reset_history_and_keep_focus_and_maximized_layout() {
+    use crate::output::{Position, Stream};
+    let mut app = App::new("Slurm");
+    app.replace_jobs(vec![job("1")]);
+    app.output_id = Some("1".into());
+    app.output_focus = true;
+    app.output_maximized = true;
+    app.output_follow = false;
+    app.output_text = "old stdout".into();
+    app.output_pending = Some("buffered stdout".into());
+    app.output_cursor = 10;
+    app.output_top = 5;
+    app.output_page_loading = true;
+    app.output_request = Some(Position::Start);
+    let old_revision = app.output_revision;
+    assert!(app.navigate(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)));
+    assert_eq!(app.output_stream, Stream::Stderr);
+    assert!(app.output_revision != old_revision);
+    assert_eq!(app.output_request, Some(Position::Tail));
+    assert!(app.output_follow && app.output_focus && app.output_maximized);
+    assert_eq!(app.output_text, "Loading stderr…");
+    assert!(app.output_pending.is_none() && app.output_page.is_none());
+    assert!(!app.output_page_loading);
+    assert_eq!((app.output_cursor, app.output_top), (0, 0));
+    let revision = app.output_revision;
+    app.navigate(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+    assert_eq!(app.output_revision, revision);
+    app.reset_output();
+    assert_eq!(app.output_stream, Stream::Stderr);
+    app.navigate(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+    assert_eq!(app.output_stream, Stream::Stdout);
+    assert_eq!(app.output_request, Some(Position::Tail));
+    assert_eq!(app.output_text, "Loading stdout…");
+    app.navigate(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+    assert_eq!(app.output_stream, Stream::Stdout);
+  }
+
+  #[test]
+  fn stderr_title_matches_the_selected_stream_in_split_and_maximized_views() {
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 40)).unwrap();
+    let mut app = App::new("Slurm");
+    app.replace_jobs(vec![job("1")]);
+    app.output_id = Some("1".into());
+    app.set_output_stream(crate::output::Stream::Stderr);
+    app.output_path = "/logs/job.err".into();
+    for maximized in [false, true] {
+      app.output_maximized = maximized;
+      terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+      let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+      assert!(text.contains("Stderr: 1"));
+      assert!(text.contains("job.err"));
+      assert!(!text.contains("Stdout: 1"));
+    }
+  }
+
   async fn finish_rebuild(worker: &mut Rebuilder, app: &mut App) {
     tokio::time::timeout(Duration::from_secs(5), async {
       loop {
-        worker.poll(app).await;
+        worker.poll(app).await.unwrap();
         if worker.pending.is_none() && worker.task.is_none() {
           break;
         }
@@ -1364,7 +1623,7 @@ mod tests {
     let mut app = App::new("Slurm");
     let mut worker = Rebuilder::default();
     worker.request(&app, Some(vec![job("1"), job("2")]), false);
-    assert!(!worker.poll(&mut app).await);
+    assert!(!worker.poll(&mut app).await.unwrap());
     assert!(worker.task.is_some());
     assert!(app.jobs.is_empty()); // The old view stays intact until completion.
     app.query = "2".into();
@@ -1385,7 +1644,7 @@ mod tests {
     finish_rebuild(&mut worker, &mut app).await;
     assert_eq!(app.selected().unwrap().id, "2");
     worker.request(&app, Some(vec![job("99")]), false);
-    worker.poll(&mut app).await;
+    worker.poll(&mut app).await.unwrap();
     worker.invalidate();
     finish_rebuild(&mut worker, &mut app).await;
     assert_eq!(app.selected().unwrap().id, "2");
@@ -1398,7 +1657,7 @@ mod tests {
     for query in ["s", "si", "sim"] {
       app.query = query.into();
       worker.request(&app, None, true);
-      assert!(!worker.poll(&mut app).await);
+      assert!(!worker.poll(&mut app).await.unwrap());
       assert!(worker.task.is_none());
     }
     assert_eq!(worker.pending.as_ref().unwrap().query, "sim");
@@ -1435,7 +1694,7 @@ mod tests {
     let mut heartbeats = 0;
     tokio::time::timeout(Duration::from_secs(5), async {
       loop {
-        worker.poll(&mut app).await;
+        worker.poll(&mut app).await.unwrap();
         worst_gap = worst_gap.max(heartbeat.elapsed());
         heartbeat = Instant::now();
         heartbeats += 1;

@@ -2,6 +2,16 @@
 
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
+use std::collections::BTreeSet;
+
+#[derive(Debug, Default)]
+pub struct Hardware {
+  pub cpu_model: Option<String>,
+  pub gpu_model: Option<String>,
+  pub architecture: Option<String>,
+  /// Site-defined labels are not necessarily hardware model names.
+  pub features: Option<String>,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Amounts {
@@ -19,6 +29,7 @@ pub struct Resources {
   pub elapsed: Option<String>,
   pub limit: Option<String>,
   pub hosts: Option<String>,
+  pub hardware: Hardware,
 }
 
 fn token<'a>(text: &'a str, key: &str) -> Option<&'a str> {
@@ -93,7 +104,62 @@ pub fn slurm(text: &str) -> Result<Resources> {
     elapsed: token(text, "RunTime=").map(str::to_owned),
     limit: token(text, "TimeLimit=").map(str::to_owned),
     hosts: token(text, "NodeList=").map(str::to_owned),
+    hardware: Hardware {
+      // Only allocated typed TRES establishes the job's GPU model. Requests
+      // and a node's complete GPU inventory do not identify assigned devices.
+      gpu_model: token(text, "AllocTRES=").and_then(gpu_models),
+      ..Default::default()
+    },
   })
+}
+
+fn joined(values: BTreeSet<String>) -> Option<String> {
+  (!values.is_empty()).then(|| values.into_iter().collect::<Vec<_>>().join(", "))
+}
+
+fn gpu_models(tres: &str) -> Option<String> {
+  joined(
+    tres
+      .split(',')
+      .filter_map(|entry| {
+        let (kind, count) = entry.split_once('=')?;
+        let model = kind.strip_prefix("gres/gpu:")?;
+        (!model.is_empty() && count.parse::<u64>().ok()? > 0).then(|| model.to_string())
+      })
+      .collect(),
+  )
+}
+
+/// Aggregate reported node metadata without guessing models from architecture
+/// or arbitrary site features. Missing fields on any node remain explicit.
+pub fn slurm_hardware(text: &str) -> Hardware {
+  let nodes: Vec<_> = text.split("NodeName=").skip(1).collect();
+  let collect = |key| {
+    joined(
+      nodes
+        .iter()
+        .map(|node| token(node, key).unwrap_or("Unknown").to_string())
+        .collect(),
+    )
+  };
+  let features = joined(
+    nodes
+      .iter()
+      .flat_map(|node| {
+        token(node, "ActiveFeatures=")
+          .or_else(|| token(node, "AvailableFeatures="))
+          .into_iter()
+          .flat_map(|value| value.split(','))
+          .map(str::to_owned)
+      })
+      .collect(),
+  );
+  Hardware {
+    cpu_model: collect("CPUModel="),
+    architecture: collect("Arch="),
+    features,
+    ..Default::default()
+  }
 }
 
 fn positive_token(text: &str, name: &str) -> Option<String> {
@@ -195,6 +261,7 @@ pub fn flux(job: &str, jobspec: &str, allocation: Option<&str>) -> Result<Resour
     memory: None,
   };
   let mut allocated = Amounts::default();
+  let mut hardware = Hardware::default();
   if let Some(text) = allocation {
     let r: Value = serde_json::from_str(text).context("Invalid Flux allocation JSON")?;
     let ranks = r
@@ -226,6 +293,25 @@ pub fn flux(job: &str, jobspec: &str, allocation: Option<&str>) -> Result<Resour
     allocated.nodes = Some(counts[0].to_string());
     allocated.cpus = Some(counts[1].to_string());
     allocated.gpus = Some(counts[2].to_string());
+    // RFC 20 properties are site-defined node labels, not confirmed models.
+    // Use only the concrete allocation, never requested jobspec constraints.
+    hardware.features = r
+      .pointer("/execution/properties")
+      .and_then(Value::as_object)
+      .and_then(|properties| {
+        joined(
+          properties
+            .iter()
+            .filter(|(_, ranks)| {
+              ranks
+                .as_str()
+                .and_then(count_idset)
+                .is_some_and(|count| count > 0)
+            })
+            .map(|(name, _)| name.clone())
+            .collect(),
+        )
+      });
   }
   let duration = jobspec
     .pointer("/attributes/system/duration")
@@ -242,12 +328,40 @@ pub fn flux(job: &str, jobspec: &str, allocation: Option<&str>) -> Result<Resour
       }
     }),
     hosts: job["nodelist"].as_str().map(str::to_owned),
+    hardware,
   })
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn hardware_models_do_not_come_from_requests_or_generic_features() {
+    let pending = slurm("JobId=1 JobState=PENDING ReqTRES=gres/gpu:h100=2").unwrap();
+    assert!(pending.hardware.gpu_model.is_none());
+    let running =
+      slurm("JobId=1 AllocTRES=gres/gpu:h100=2,gres/gpu:a100=1,gres/gpu:l40=0").unwrap();
+    assert_eq!(running.hardware.gpu_model.as_deref(), Some("a100, h100"));
+    let hardware = slurm_hardware(
+      "NodeName=n1 Arch=x86_64 ActiveFeatures=zen4,gpu CPUModel=EPYC_9654\nNodeName=n2 Arch=aarch64 ActiveFeatures=arm,gpu\n",
+    );
+    assert_eq!(hardware.cpu_model.as_deref(), Some("EPYC_9654, Unknown"));
+    assert_eq!(hardware.architecture.as_deref(), Some("aarch64, x86_64"));
+    assert_eq!(hardware.features.as_deref(), Some("arm, gpu, zen4"));
+    assert!(hardware.gpu_model.is_none());
+    assert!(slurm_hardware("permission denied").cpu_model.is_none());
+  }
+
+  #[test]
+  fn flux_reports_allocated_properties_without_claiming_they_are_models() {
+    let spec = r#"{"resources":[{"type":"core","count":2}],"attributes":{"system":{"constraints":{"properties":["requested-model"]}}}}"#;
+    let allocation = r#"{"execution":{"R_lite":[{"rank":"0","children":{"core":"0-1"}}],"properties":{"zen4":"0","batch":"0","empty":"","invalid":"x"}}}"#;
+    let r = flux("{}", spec, Some(allocation)).unwrap();
+    assert_eq!(r.hardware.features.as_deref(), Some("batch, zen4"));
+    assert!(r.hardware.cpu_model.is_none() && r.hardware.gpu_model.is_none());
+    assert!(flux("{}", spec, None).unwrap().hardware.features.is_none());
+  }
   #[test]
   fn slurm_tasks_are_declared_not_inferred_from_allocated_cpus() {
     let r = slurm("JobId=1 JobState=RUNNING NumTasks=32 CPUs/Task=4 ReqTRES=cpu=128,node=4 AllocTRES=cpu=128,node=4").unwrap();

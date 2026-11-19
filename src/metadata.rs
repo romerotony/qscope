@@ -119,6 +119,8 @@ impl Metadata {
     let value = fetch().await.map_err(|error| format!("{error:#}"));
     let lifetime = if value.is_ok() {
       ttl
+    } else if kind == "nodes" {
+      Duration::from_secs(60)
     } else {
       Duration::from_secs(5)
     };
@@ -147,7 +149,9 @@ impl Metadata {
       self
         .signatures
         .retain(|id, _| self.entries.iter().any(|entry| &entry.id == id));
-      self.signatures.entry(id.into()).or_insert(None);
+      if kind != "nodes" {
+        self.signatures.entry(id.into()).or_insert(None);
+      }
     }
     value.map_err(anyhow::Error::msg)
   }
@@ -171,6 +175,20 @@ impl Metadata {
         .split_whitespace()
         .find_map(|part| part.strip_prefix("JobState="))
         .unwrap_or("");
+      if let Some(hosts) = resources.hosts.as_deref()
+        && hosts != "None"
+        && hosts != "—"
+        && !matches!(state, "PENDING" | "CONFIGURING")
+        && let Ok(nodes) = self
+          .fetch(hosts, "nodes", Duration::from_secs(300), || {
+            backend.nodes(hosts)
+          })
+          .await
+      {
+        let gpu_model = resources.hardware.gpu_model.take();
+        resources.hardware = crate::resources::slurm_hardware(&nodes);
+        resources.hardware.gpu_model = gpu_model;
+      }
       self.advance_elapsed(id, state, &mut resources);
       return Ok(resources);
     }
@@ -213,6 +231,44 @@ impl Metadata {
 mod tests {
   use super::*;
   use std::sync::atomic::{AtomicUsize, Ordering};
+
+  #[tokio::test]
+  async fn node_cache_survives_job_observation_and_throttles_failed_lookups() {
+    let mut cache = Metadata::default();
+    let calls = AtomicUsize::new(0);
+    for _ in 0..3 {
+      cache
+        .fetch("n[1-2]", "nodes", Duration::from_secs(300), || async {
+          calls.fetch_add(1, Ordering::SeqCst);
+          Ok("NodeName=n1 Arch=x86_64".into())
+        })
+        .await
+        .unwrap();
+      assert!(cache.observe(&[]).is_empty());
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(cache.signatures.is_empty());
+    for _ in 0..3 {
+      assert!(
+        cache
+          .fetch("restricted", "nodes", Duration::from_secs(300), || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("denied")
+          })
+          .await
+          .is_err()
+      );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let failed = cache
+      .entries
+      .iter()
+      .find(|entry| entry.id == "restricted")
+      .unwrap();
+    assert!(failed.expires > Instant::now() + Duration::from_secs(55));
+    cache.clear();
+    assert!(cache.entries.is_empty());
+  }
 
   fn job(state: &str) -> Job {
     Job {
@@ -373,10 +429,24 @@ mod tests {
       for _ in 0..2 {
         let resources = source.resources("1", &mut cache).await.unwrap();
         assert_eq!(resources.requested.cpus.as_deref(), Some("8"));
-        source
-          .output("1", &mut reader, crate::output::Position::Tail, &mut cache)
-          .await
-          .unwrap();
+        assert_eq!(resources.hardware.cpu_model.as_deref(), Some("EPYC_9654"));
+        assert_eq!(resources.hardware.architecture.as_deref(), Some("x86_64"));
+        for (stream, expected) in [
+          (crate::output::Stream::Stdout, "hello\n"),
+          (crate::output::Stream::Stderr, "diagnostic\n"),
+        ] {
+          let output = source
+            .output(
+              "1",
+              &mut reader,
+              crate::output::Position::Tail,
+              &mut cache,
+              stream,
+            )
+            .await
+            .unwrap();
+          assert_eq!(output.text, expected);
+        }
       }
       let count_path = std::env::var("QSCOPE_COUNT").unwrap();
       assert_eq!(
@@ -384,28 +454,36 @@ mod tests {
           .unwrap()
           .lines()
           .count(),
-        1
+        2 // One shared job query plus one cached node query.
       );
       cache.clear();
       reader.clear_paths();
       source.resources("1", &mut cache).await.unwrap();
       source
-        .output("1", &mut reader, crate::output::Position::Tail, &mut cache)
+        .output(
+          "1",
+          &mut reader,
+          crate::output::Position::Tail,
+          &mut cache,
+          crate::output::Stream::Stdout,
+        )
         .await
         .unwrap();
       assert_eq!(
         std::fs::read_to_string(count_path).unwrap().lines().count(),
-        2
+        4 // Manual refresh invalidates both caches.
       );
       return;
     }
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
     let script = directory.path().join("scontrol");
-    std::fs::write(&script, "#!/bin/sh\necho called >> \"$QSCOPE_COUNT\"\nprintf 'JobId=1 JobState=RUNNING ReqTRES=cpu=8,node=1 RunTime=00:00:10\\n StdOut=%s\\n WorkDir=/\\n' \"$QSCOPE_LOG\"\n").unwrap();
+    std::fs::write(&script, "#!/bin/sh\necho \"$*\" >> \"$QSCOPE_COUNT\"\nif [ \"$2\" = node ]; then\n  [ \"$3\" = n1 ] || exit 1\n  echo 'NodeName=n1 Arch=x86_64 CPUModel=EPYC_9654 ActiveFeatures=zen4'\nelse\n  printf 'JobId=1 JobState=RUNNING ReqTRES=cpu=8,node=1 RunTime=00:00:10 NodeList=n1\\n StdOut=%s\\n StdErr=%s\\n WorkDir=/\\n' \"$QSCOPE_LOG\" \"$QSCOPE_ERR\"\nfi\n").unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     let log = directory.path().join("job.out");
     std::fs::write(&log, "hello\n").unwrap();
+    let error_log = directory.path().join("diagnostics.log");
+    std::fs::write(&error_log, "diagnostic\n").unwrap();
     let result = tokio::process::Command::new(std::env::current_exe().unwrap())
       .args([
         "--exact",
@@ -415,6 +493,7 @@ mod tests {
       .env(CHILD, "1")
       .env("PATH", directory.path())
       .env("QSCOPE_LOG", log)
+      .env("QSCOPE_ERR", error_log)
       .env("QSCOPE_COUNT", directory.path().join("count"))
       .output()
       .await

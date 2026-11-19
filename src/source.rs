@@ -62,12 +62,22 @@ impl Source {
           } else {
             None
           },
+          hardware: if matches!(job.state.as_str(), "RUN" | "RUNNING") {
+            crate::resources::Hardware {
+              cpu_model: Some("AMD EPYC 9654 (simulated)".into()),
+              gpu_model: (job.queue == "gpu").then(|| "NVIDIA A100 (simulated)".into()),
+              architecture: Some("x86_64".into()),
+              features: None,
+            }
+          } else {
+            crate::resources::Hardware::default()
+          },
         })
       }
     }
   }
 
-  /// Read local stdout only for Slurm. Flux output can live in its KVS and
+  /// Read local output only for Slurm. Flux output can live in its KVS and
   /// needs a separate implementation; do not guess a Slurm filename for it.
   pub async fn output(
     &mut self,
@@ -75,20 +85,21 @@ impl Source {
     reader: &mut Reader,
     position: output::Position,
     cache: &mut Metadata,
+    stream: output::Stream,
   ) -> Result<Output> {
     match self {
       Self::Live(backend) if backend.kind == Scheduler::Slurm => {
-        let path = match reader.path(id) {
+        let path = match reader.path(id, stream) {
           Some(path) => path,
           None => {
-            let path = output::slurm_path(&cache.details(backend, id, false).await?)?;
-            reader.remember(id, path.clone());
+            let path = output::slurm_path(&cache.details(backend, id, false).await?, stream)?;
+            reader.remember(id, stream, path.clone());
             path
           }
         };
         reader.read(path, position).await
       }
-      Self::Live(_) => bail!("Stdout preview currently supports Slurm only"),
+      Self::Live(_) => bail!("{} preview currently supports Slurm only", stream.title()),
       Self::Demo(demo) => {
         let job = demo
           .jobs
@@ -96,11 +107,22 @@ impl Source {
           .find(|job| job.id == id)
           .ok_or_else(|| anyhow::anyhow!("Unknown demo job: {id}"))?;
         let mut text = format!(
-          "DEMO — simulated stdout; no files are read.\nJob {}: {}\nState: {}\n",
-          job.id, job.name, job.state
+          "DEMO — simulated {}; no files are read.\nJob {}: {}\nState: {}\n",
+          stream.name(),
+          job.id,
+          job.name,
+          job.state
         );
         if matches!(job.state.as_str(), "PENDING" | "SCHED" | "DEPEND") {
-          text.push_str("Waiting to start; stdout has not been created yet.\n");
+          text.push_str(&format!(
+            "Waiting to start; {} has not been created yet.\n",
+            stream.name()
+          ));
+        } else if stream == output::Stream::Stderr {
+          text.push_str("Simulated diagnostic: job initialization complete.\n");
+          if matches!(job.state.as_str(), "FAILED" | "CANCELLED" | "CANCELED") {
+            text.push_str(&format!("Job stopped: {}\n", job.reason));
+          }
         } else {
           for step in 1..=demo.started.elapsed().as_secs().min(100) + 5 {
             text.push_str(&format!(
@@ -113,7 +135,15 @@ impl Source {
           }
         }
         Ok(Output {
-          path: format!("DEMO /demo/logs/{}.out", job.id),
+          path: format!(
+            "DEMO /demo/logs/{}.{}",
+            job.id,
+            if stream == output::Stream::Stdout {
+              "out"
+            } else {
+              "err"
+            }
+          ),
           text,
           page: None,
         })
@@ -360,6 +390,7 @@ mod tests {
           &mut reader,
           output::Position::Tail,
           &mut Metadata::default(),
+          output::Stream::Stdout,
         )
         .await
         .unwrap();
@@ -371,7 +402,8 @@ mod tests {
             &jobs[2].id,
             &mut reader,
             output::Position::Tail,
-            &mut Metadata::default()
+            &mut Metadata::default(),
+            output::Stream::Stdout
           )
           .await
           .unwrap()
@@ -384,11 +416,25 @@ mod tests {
             "unknown",
             &mut reader,
             output::Position::Tail,
-            &mut Metadata::default()
+            &mut Metadata::default(),
+            output::Stream::Stdout
           )
           .await
           .is_err()
       );
+      let error_output = source
+        .output(
+          &jobs[0].id,
+          &mut reader,
+          output::Position::Tail,
+          &mut Metadata::default(),
+          output::Stream::Stderr,
+        )
+        .await
+        .unwrap();
+      assert!(error_output.path.ends_with(".err"));
+      assert!(error_output.text.contains("simulated stderr"));
+      assert!(!error_output.text.contains("step 001"));
     }
   }
 
@@ -404,6 +450,7 @@ mod tests {
         &mut Reader::default(),
         output::Position::Tail,
         &mut Metadata::default(),
+        output::Stream::Stdout,
       )
       .await
       .unwrap_err();
